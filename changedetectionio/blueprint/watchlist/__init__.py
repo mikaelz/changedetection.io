@@ -82,6 +82,11 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
         sorted_tags = sorted(datastore.data['settings']['application'].get('tags').items(), key=lambda x: x[1]['title'])
 
         proxy_list = datastore.proxy_list
+
+        from changedetectionio.llm.evaluator import get_llm_config as _get_llm_config
+        from changedetectionio.llm.ui_strings import LLM_INTENT_WATCH_PLACEHOLDER
+        llm_configured = bool(_get_llm_config(datastore))
+
         output = render_template(
             "watch-overview.html",
             active_tag=active_tag,
@@ -89,9 +94,10 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
             app_rss_token=datastore.data['settings']['application'].get('rss_access_token'),
             datastore=datastore,
             errored_count=errored_count,
-            extra_classes='has-queue' if not update_q.empty() else '',
+            extra_classes=' '.join(filter(None, ['has-queue' if not update_q.empty() else '', 'llm-configured' if llm_configured else ''])),
             form=form,
             generate_tag_colors=processors.generate_processor_badge_colors,
+            wcag_text_color=processors.wcag_text_color,
             guid=datastore.data['app_guid'],
             has_proxies=proxy_list,
             hosted_sticky=os.getenv("SALTED_PASS", False) == False,
@@ -108,7 +114,9 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
             system_default_fetcher=datastore.data['settings']['application'].get('fetch_backend'),
             tags=sorted_tags,
             unread_changes_count=datastore.unread_changes_count,
-            watches=sorted_watches
+            watches=sorted_watches,
+            llm_configured=llm_configured,
+            llm_intent_watch_placeholder=LLM_INTENT_WATCH_PLACEHOLDER,
         )
 
         # Return freed template-building memory to the OS immediately.

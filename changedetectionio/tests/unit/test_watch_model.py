@@ -249,5 +249,134 @@ class TestDiffBuilder(unittest.TestCase):
         self.assertLess(elapsed, 0.5,
                        f"Deepcopy too slow ({elapsed:.3f}s for 10 copies) - might be copying datastore")
 
+class TestLLMDiffSummaryCache(unittest.TestCase):
+    """Tests for get_llm_diff_summary / save_llm_diff_summary — version-pair + prompt-hash caching."""
+
+    PROMPT = 'List what changed as bullet points'
+
+    def _make_watch(self):
+        mock_datastore = {'settings': {'application': {}}, 'watching': {}}
+        watch = Watch.model(datastore_path='/tmp', __datastore=mock_datastore, default={})
+        watch.ensure_data_dir_exists()
+        return watch
+
+    def test_returns_empty_when_no_file_exists(self):
+        watch = self._make_watch()
+        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == ''
+
+    def test_save_and_retrieve(self):
+        watch = self._make_watch()
+        watch.save_llm_diff_summary('Price dropped to $199', '1000', '2000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == 'Price dropped to $199'
+
+    def test_different_version_pairs_are_independent(self):
+        watch = self._make_watch()
+        watch.save_llm_diff_summary('Summary A', '1000', '2000', prompt=self.PROMPT)
+        watch.save_llm_diff_summary('Summary B', '2000', '3000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == 'Summary A'
+        assert watch.get_llm_diff_summary('2000', '3000', prompt=self.PROMPT) == 'Summary B'
+
+    def test_unknown_pair_returns_empty(self):
+        watch = self._make_watch()
+        watch.save_llm_diff_summary('Summary A', '1000', '2000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary('9999', '8888', prompt=self.PROMPT) == ''
+
+    def test_changed_prompt_is_a_cache_miss(self):
+        """Changing the prompt must invalidate the cached summary for the same version pair."""
+        watch = self._make_watch()
+        watch.save_llm_diff_summary('Old summary', '1000', '2000', prompt='original prompt')
+        # Different prompt → different hash → different filename → miss
+        assert watch.get_llm_diff_summary('1000', '2000', prompt='new different prompt') == ''
+
+    def test_file_named_by_versions_and_prompt_hash(self):
+        """Cache file must be named change-summary-{from}-to-{to}-{hash}.txt."""
+        import hashlib
+        watch = self._make_watch()
+        prompt = 'my summary prompt'
+        watch.save_llm_diff_summary('Test summary', '1776000000', '1776001000', prompt=prompt)
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:8]
+        expected_path = os.path.join(
+            watch.data_dir,
+            f'change-summary-1776000000-to-1776001000-{prompt_hash}.txt'
+        )
+        assert os.path.isfile(expected_path), \
+            f"Expected cache file not found: {expected_path}"
+        with open(expected_path, 'r') as f:
+            assert f.read().strip() == 'Test summary'
+
+    def test_overwrite_same_pair_and_prompt(self):
+        watch = self._make_watch()
+        watch.save_llm_diff_summary('First summary', '1000', '2000', prompt=self.PROMPT)
+        watch.save_llm_diff_summary('Updated summary', '1000', '2000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == 'Updated summary'
+
+
+class TestHistoryPathTraversal(unittest.TestCase):
+    """GHSA-8757-69j2-hx56: history.txt must not allow reads outside the watch data dir."""
+
+    def _make_watch(self):
+        mock_datastore = {'settings': {'application': {}}, 'watching': {}}
+        watch = Watch.model(datastore_path='/tmp', __datastore=mock_datastore, default={})
+        watch.ensure_data_dir_exists()
+        return watch
+
+    def _write_history_txt(self, watch, lines):
+        """Directly write raw lines to history.txt to simulate a restored backup."""
+        fname = os.path.join(watch.data_dir, watch.history_index_filename)
+        with open(fname, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+
+    def test_absolute_path_in_history_is_rejected(self):
+        """An absolute path like /etc/passwd must not appear in history."""
+        watch = self._make_watch()
+        self._write_history_txt(watch, ['1000000000,/etc/passwd\n'])
+        history = watch.history
+        self.assertEqual(history, {}, "Absolute path entry must be rejected")
+
+    def test_traversal_path_in_history_is_rejected(self):
+        """A relative traversal path like ../../etc/passwd must not appear in history."""
+        watch = self._make_watch()
+        self._write_history_txt(watch, ['1000000000,../../etc/passwd\n'])
+        history = watch.history
+        self.assertEqual(history, {}, "Path traversal entry must be rejected")
+
+    def test_normal_snapshot_entry_is_accepted(self):
+        """A bare filename written by save_history_blob must still load correctly."""
+        import uuid as uuid_builder
+        watch = self._make_watch()
+        watch.save_history_blob(contents="hello world", timestamp=1000000000, snapshot_id=str(uuid_builder.uuid4()))
+        history = watch.history
+        self.assertEqual(len(history), 1, "Normal snapshot entry must be accepted")
+        self.assertTrue(
+            list(history.values())[0].startswith(watch.data_dir),
+            "Resolved path must be inside the watch data directory"
+        )
+
+    def test_get_history_snapshot_blocks_outside_path_directly(self):
+        """get_history_snapshot(filepath=...) must raise if the path escapes data_dir."""
+        watch = self._make_watch()
+        with self.assertRaises(PermissionError):
+            watch.get_history_snapshot(filepath='/etc/passwd')
+
+    def test_get_history_snapshot_blocks_traversal_directly(self):
+        """get_history_snapshot(filepath=...) must raise on ../../ traversal paths."""
+        watch = self._make_watch()
+        with self.assertRaises(PermissionError):
+            watch.get_history_snapshot(filepath=os.path.join(watch.data_dir, '../../etc/passwd'))
+
+    def test_resolved_path_stays_inside_data_dir(self):
+        """All resolved history paths must reside within the watch's data_dir."""
+        import uuid as uuid_builder
+        watch = self._make_watch()
+        for ts in [1000000001, 1000000002, 1000000003]:
+            watch.save_history_blob(contents=f"content {ts}", timestamp=ts, snapshot_id=str(uuid_builder.uuid4()))
+        safe_dir = os.path.realpath(watch.data_dir)
+        for path in watch.history.values():
+            self.assertTrue(
+                os.path.realpath(path).startswith(safe_dir),
+                f"Path {path!r} escapes the watch data directory"
+            )
+
+
 if __name__ == '__main__':
     unittest.main()

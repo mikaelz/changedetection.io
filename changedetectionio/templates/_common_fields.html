@@ -1,7 +1,7 @@
 
 {% from '_helpers.html' import render_field %}
 
-{% macro show_token_placeholders(extra_notification_token_placeholder_info, suffix="") %}
+{% macro show_token_placeholders(extra_notification_token_placeholder_info, suffix="", settings_application=None) %}
 
 
     <div class="pure-controls">
@@ -46,11 +46,7 @@
             </tr>
             <tr>
                 <td><code>{{ '{{change_datetime}}' }}</code></td>
-                <td>{{ _('Date/time of the change, accepts format=, change_datetime(format=\'%A\')\', default is \'%Y-%m-%d %H:%M:%S %Z\'') }}</td>
-            </tr>
-            <tr>
-                <td><code>{{ '{{diff_url}}' }}</code></td>
-                <td>{{ _('The URL of the diff output for the watch.') }}</td>
+                <td>{{ _("Date/time of the change, accepts format=, %(call)s, default is '%(default)s'", call="change_datetime(format='%A')", default="%Y-%m-%d %H:%M:%S %Z") }}</td>
             </tr>
             <tr>
                 <td><code>{{ '{{diff_url}}' }}</code></td>
@@ -99,6 +95,14 @@
                 <td>{{ _('The diff output - patch in unified format') }}</td>
             </tr>
             <tr>
+                <td><code>{{ '{{diff_changed_from}}' }}</code></td>
+                <td>{{ _('Only the changed words/values from the previous version — e.g. the old price. Best when a single value changes per line; multiple changed fragments are joined by newline.') }}</td>
+            </tr>
+            <tr>
+                <td><code>{{ '{{diff_changed_to}}' }}</code></td>
+                <td>{{ _('Only the changed words/values from the new version — e.g. the new price. Best when a single value changes per line; multiple changed fragments are joined by newline.') }}</td>
+            </tr>
+            <tr>
                 <td><code>{{ '{{current_snapshot}}' }}</code></td>
                 <td>{{ _('The current snapshot text contents value, useful when combined with JSON or CSS filters') }}
                 </td>
@@ -106,7 +110,25 @@
             <tr>
                 <td><code>{{ '{{triggered_text}}' }}</code></td>
                 <td>{{ _('Text that tripped the trigger from filters') }}</td>
-
+            </tr>
+            {% if not llm_features_disabled and settings_application and settings_application.get('llm', {}).get('model') %}
+            <tr>
+                <td><code>{{ '{{diff}}' }}</code> <small style="opacity:0.6">{{ _('(upgraded)') }}</small></td>
+                <td>{{ _('When AI Change Summary is configured, contains the AI-generated description instead of the raw diff. Falls back to raw diff when not configured.') }}</td>
+            </tr>
+            <tr>
+                <td><code>{{ '{{raw_diff}}' }}</code></td>
+                <td>{{ _('Always the raw +/- diff, regardless of AI Change Summary setting.') }}</td>
+            </tr>
+            <tr>
+                <td><code>{{ '{{llm_summary}}' }}</code></td>
+                <td>{{ _('The AI Change Summary text (same as the upgraded {{diff}} — explicit reference).') }}</td>
+            </tr>
+            <tr>
+                <td><code>{{ '{{llm_intent}}' }}</code></td>
+                <td>{{ _('The AI Change Intent that was evaluated.') }}</td>
+            </tr>
+            {% endif %}
                 {% if extra_notification_token_placeholder_info %}
                     {% for token in extra_notification_token_placeholder_info %}
                         <tr>
@@ -136,7 +158,8 @@
                             }}
                             <div class="pure-form-message-inline">
                                 <p>
-                                <strong>{{ _('Tip:') }}</strong> {{ _('Use') }} <a target="newwindow" href="https://github.com/caronc/apprise">{{ _('AppRise Notification URLs') }}</a> {{ _('for notification to just about any service!') }} <i><a target="newwindow" href="https://github.com/dgtlmoon/changedetection.io/wiki/Notification-configuration-notes">{{ _('Please read the notification services wiki here for important configuration notes') }}</a></i>.<br>
+                                <strong>{{ _('Tip:') }}</strong> {{ _('Use <a target="newwindow" href="%(url)s">AppRise Notification URLs</a> for notification to just about any service!',
+                                    url='https://github.com/caronc/apprise')|safe }} <a target="newwindow" href="https://github.com/dgtlmoon/changedetection.io/wiki/Notification-configuration-notes">{# TRANSLATORS: CJK fonts lack native italics; allow substitution with conventional local styling. dennis-ignore: W303 #}{{ _('<i>Please read the notification services wiki here for important configuration notes</i>')|safe }}</a>.<br>
 </p>
                                 <div data-target="#advanced-help-notifications" class="toggle-show pure-button button-tag button-xsmall">{{ _('Show advanced help and tips') }}</div>
                                 <ul style="display: none" id="advanced-help-notifications">
@@ -144,7 +167,7 @@
                                 <li><code><a target="newwindow" href="https://github.com/caronc/apprise/wiki/Notify_telegram">tgram://</a></code> {{ _('bots can\'t send messages to other bots, so you should specify chat ID of non-bot user.') }}</li>
                                 <li><code><a target="newwindow" href="https://github.com/caronc/apprise/wiki/Notify_telegram">tgram://</a></code> {{ _('only supports very limited HTML and can fail when extra tags are sent,') }} <a href="https://core.telegram.org/bots/api#html-style">{{ _('read more here') }}</a> {{ _('(or use plaintext/markdown format)') }}</li>
                                 <li><code>gets://</code>, <code>posts://</code>, <code>puts://</code>, <code>deletes://</code> {{ _('for direct API calls (or omit the') }} "<code>s</code>" {{ _('for non-SSL ie') }} <code>get://</code>) <a href="https://github.com/dgtlmoon/changedetection.io/wiki/Notification-configuration-notes#postposts">{{ _('more help here') }}</a></li>
-                                  <li>{{ _('Accepts the') }} <code>{{ '{{token}}' }}</code> {{ _('placeholders listed below') }}</li>
+                                  <li>{{ _('Accepts the <code>%(token)s</code> placeholders listed below', token='{{token}}')|safe }}</li>
                               </ul>
                             </div>
                             <div class="notifications-wrapper">
@@ -165,7 +188,7 @@
                             </div>
                             <div class="pure-control-group">
                                 {{ render_field(form.notification_body , rows=5, class="notification-body", placeholder=settings_application['notification_body']) }}
-                                {{ show_token_placeholders(extra_notification_token_placeholder_info=extra_notification_token_placeholder_info) }}
+                                {{ show_token_placeholders(extra_notification_token_placeholder_info=extra_notification_token_placeholder_info, settings_application=settings_application) }}
                                 <div class="pure-form-message-inline">
                                     <ul>
                                     <li><span class="pure-form-message-inline">
@@ -187,6 +210,10 @@
                             <div class="">
                                 {{ render_field(form.notification_format , class="notification-format") }}
                                 <span class="pure-form-message-inline">{{ _('Format for all notifications') }}</span>
+                                <div id="discord-html-format-warning" class="inline-warning" style="display: none; margin-top: 6px;">
+                                    <img class="inline-warning-icon" src="{{url_for('static_content', group='images', filename='notice.svg')}}" alt="{{ _('Note') }}" title="{{ _('Note') }}">
+                                    {{ _('Discord does not render HTML — switch to') }} <strong>{{ _('Plain Text') }}</strong> {{ _('format to avoid') }} <code>&amp;nbsp;</code> {{ _('and other HTML entities appearing literally in your notifications.') }}
+                                </div>
                             </div>
                         </div>
 {% endmacro %}

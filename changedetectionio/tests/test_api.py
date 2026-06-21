@@ -102,6 +102,8 @@ def test_api_simple(client, live_server, measure_memory_usage, datastore_path):
     #705 `last_changed` should be zero on the first check
     assert before_recheck_info['last_changed'] == 0
     assert before_recheck_info['title'] == 'My test URL'
+    assert isinstance(before_recheck_info['link'], str), "link must be a plain string, not a tuple or list"
+    assert before_recheck_info['link'] == test_url
 
     # Check the limit by tag doesnt return anything when nothing found
     res = client.get(
@@ -374,6 +376,9 @@ def test_roundtrip_API(client, live_server, measure_memory_usage, datastore_path
     watch['last_changed'] = 454444444444
     watch['date_created'] = 454444444444
 
+    # Exercise the new extract_lines_containing field
+    watch['extract_lines_containing'] = ['celsius', 'temperature']
+
     # HTTP PUT ( UPDATE an existing watch )
     res = client.put(
         url_for("watch", uuid=uuid),
@@ -396,6 +401,109 @@ def test_roundtrip_API(client, live_server, measure_memory_usage, datastore_path
     date_created = res.json.get('date_created')
     assert date_created != 454444444444
     assert date_created != "454444444444"
+
+    assert res.json.get('extract_lines_containing') == ['celsius', 'temperature'], \
+        "extract_lines_containing should be persisted and returned via API"
+
+
+def test_api_strips_internal_fields(client, live_server, measure_memory_usage, datastore_path):
+    """
+    Internal/transient fields must never cross the API boundary in either direction:
+      1. `__`-prefixed keys (e.g. `__check_status` set by the worker for UI status)
+      2. System-managed fields not in the OpenAPI spec (see SYSTEM_MANAGED_NON_SPEC_FIELDS):
+         `last_check_status`, `last_filter_config_hash`, `_llm_*`, `llm_*`, etc.
+
+    GET responses must strip them. PUT/POST payloads must silently discard them.
+    Without this, a client that round-trips GET → PUT trips the unknown-field validator.
+    """
+    from changedetectionio.model.schema_utils import SYSTEM_MANAGED_NON_SPEC_FIELDS
+
+    api_key = live_server.app.config['DATASTORE'].data['settings']['application'].get('api_access_token')
+    datastore = live_server.app.config['DATASTORE']
+
+    set_original_response(datastore_path=datastore_path)
+    test_url = url_for('test_endpoint', _external=True)
+
+    # Create
+    res = client.post(
+        url_for("createwatch"),
+        data=json.dumps({"url": test_url}),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+        follow_redirects=True
+    )
+    assert res.status_code == 201
+    watch_uuid = res.json.get('uuid')
+
+    wait_for_all_checks(client)
+
+    # Force both a transient __-prefixed and a system-managed field onto the watch,
+    # simulating worker/processor-set state.
+    watch_obj = datastore.data['watching'][watch_uuid]
+    watch_obj['__check_status'] = 'Fetching page..'
+    watch_obj['last_check_status'] = 200
+    watch_obj['_llm_result'] = {'summary': 'cached llm output'}
+    watch_obj['last_filter_config_hash'] = 'abc123'
+
+    # --- GET must strip all internal fields ---
+    res = client.get(
+        url_for("watch", uuid=watch_uuid),
+        headers={'x-api-key': api_key},
+    )
+    assert res.status_code == 200
+    assert not any(k.startswith('__') for k in res.json.keys()), \
+        f"No __-prefixed field should leak into API responses; got keys: {list(res.json.keys())}"
+    leaked_system_fields = SYSTEM_MANAGED_NON_SPEC_FIELDS & set(res.json.keys())
+    assert not leaked_system_fields, \
+        f"System-managed non-spec fields must not appear in GET response; leaked: {leaked_system_fields}"
+
+    # --- PUT must accept (and silently drop) those same internal fields ---
+    # This is the key round-trip property: a client should be able to PUT back what it just GET'd.
+    # Use the actual GET response as the payload (the realistic round-trip case).
+    payload = dict(res.json)
+    payload['__check_status'] = 'attacker-supplied value'   # not in the GET, but a client could add it
+    payload['last_check_status'] = 999                       # ditto
+    payload['_llm_result'] = 'attacker overwrite'
+    res = client.put(
+        url_for("watch", uuid=watch_uuid),
+        headers={'x-api-key': api_key, 'content-type': 'application/json'},
+        data=json.dumps(payload),
+    )
+    assert res.status_code == 200, \
+        f"PUT round-tripping GET response plus internal fields should succeed (got {res.status_code}: {res.data!r})"
+
+    # Internal fields must not have been overwritten by the PUT
+    assert watch_obj.get('__check_status') == 'Fetching page..', \
+        "PUT must not overwrite __-prefixed fields"
+    assert watch_obj.get('_llm_result') == {'summary': 'cached llm output'}, \
+        "PUT must not overwrite system-managed non-spec fields"
+
+    # --- POST must also silently discard internal fields ---
+    # Use unique sentinel values so we can distinguish "POST persisted my value" from
+    # "the worker concurrently re-set the field while processing the new watch".
+    attacker_check_status = 'attacker-sentinel-__check_status-9f7c'
+    attacker_llm_result = 'attacker-sentinel-_llm_result-9f7c'
+    res = client.post(
+        url_for("createwatch"),
+        data=json.dumps({
+            "url": test_url + "?2",
+            "__check_status": attacker_check_status,
+            "_llm_result": attacker_llm_result,
+        }),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+        follow_redirects=True,
+    )
+    assert res.status_code == 201, \
+        f"POST with internal fields should succeed (got {res.status_code}: {res.data!r})"
+    new_uuid = res.json.get('uuid')
+    new_watch = datastore.data['watching'][new_uuid]
+    # If POST had persisted the attacker payload these specific sentinel values would remain.
+    # The worker may legitimately re-set __check_status with its own status string, that's fine.
+    assert new_watch.get('__check_status') != attacker_check_status, \
+        "POST must not persist __-prefixed fields from input"
+    assert new_watch.get('_llm_result') != attacker_llm_result, \
+        "POST must not persist system-managed fields from input"
+
+    delete_all_watches(client)
 
 
 def test_access_denied(client, live_server, measure_memory_usage, datastore_path):
@@ -893,6 +1001,101 @@ def test_api_restock_processor_config(client, live_server, measure_memory_usage,
     assert res.status_code == 400, "Unknown fields should be rejected"
     assert (b'Validation failed' in res.data or b'Unknown field' in res.data), \
         "Rejection should come from either the OpenAPI spec validation layer or application field filter"
+
+    delete_all_watches(client)
+
+
+def test_api_watch_get_returns_resolved_restock_processor_config(client, live_server, measure_memory_usage, datastore_path):
+    """
+    GET /api/v1/watch/{uuid} must include processor_config_restock_diff and
+    processor_config_restock_diff_source in the response.
+
+    Two cases:
+    - Watch-level config only: source == 'watch', config reflects the watch's own settings.
+    - Tag with overrides_watch=True: source == 'tag:<uuid>', config reflects the tag's settings
+      regardless of what the watch itself has stored.
+    """
+    api_key = live_server.app.config['DATASTORE'].data['settings']['application'].get('api_access_token')
+    test_url = url_for('test_endpoint', _external=True)
+
+    # --- Case 1: watch-level config, no tag override ---
+    res = client.post(
+        url_for("createwatch"),
+        data=json.dumps({
+            "url": test_url,
+            "processor": "restock_diff",
+            "processor_config_restock_diff": {
+                "in_stock_processing": "all_changes",
+                "follow_price_changes": False,
+                "price_change_min": 1.23,
+            }
+        }),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+    )
+    assert res.status_code == 201
+    watch_uuid = res.json.get('uuid')
+
+    res = client.get(url_for("watch", uuid=watch_uuid), headers={'x-api-key': api_key})
+    assert res.status_code == 200
+    data = res.json
+    assert 'processor_config_restock_diff' in data, "GET should include processor_config_restock_diff"
+    assert 'processor_config_restock_diff_source' in data, "GET should include processor_config_restock_diff_source"
+    assert data['processor_config_restock_diff_source'] == 'watch'
+    assert data['processor_config_restock_diff'].get('in_stock_processing') == 'all_changes'
+    assert data['processor_config_restock_diff'].get('follow_price_changes') == False
+    assert data['processor_config_restock_diff'].get('price_change_min') == 1.23
+
+    # --- Case 2: tag with overrides_watch=True overrides watch-level config ---
+    res = client.post(
+        url_for("tag"),
+        data=json.dumps({
+            "title": "Override tag",
+            "overrides_watch": True,
+            "processor_config_restock_diff": {
+                "in_stock_processing": "in_stock_only",
+                "follow_price_changes": True,
+                "price_change_min": 999.0,
+            }
+        }),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+    )
+    assert res.status_code == 201
+    tag_uuid = res.json.get('uuid')
+
+    # Assign the tag to the watch
+    res = client.put(
+        url_for("watch", uuid=watch_uuid),
+        data=json.dumps({"tags": [tag_uuid]}),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+    )
+    assert res.status_code == 200
+
+    res = client.get(url_for("watch", uuid=watch_uuid), headers={'x-api-key': api_key})
+    assert res.status_code == 200
+    data = res.json
+    assert data['processor_config_restock_diff_source'] == f'tag:{tag_uuid}', \
+        "Source should show the overriding tag UUID"
+    assert data['processor_config_restock_diff'].get('in_stock_processing') == 'in_stock_only', \
+        "Tag config should override watch-level config"
+    assert data['processor_config_restock_diff'].get('price_change_min') == 999.0, \
+        "Tag price_change_min should override watch-level value"
+
+    # processor_config_restock_diff is readonly — PUT attempts to set the resolved field should be
+    # silently ignored (the field is stripped before the watch is updated, same as other readOnly fields)
+    res = client.put(
+        url_for("watch", uuid=watch_uuid),
+        data=json.dumps({"processor_config_restock_diff": {"in_stock_processing": "off"}}),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+    )
+    # PUT with processor_config_restock_diff is still valid (sets watch-level config),
+    # but the GET response continues to reflect the tag override
+    assert res.status_code == 200
+    res = client.get(url_for("watch", uuid=watch_uuid), headers={'x-api-key': api_key})
+    data = res.json
+    assert data['processor_config_restock_diff_source'] == f'tag:{tag_uuid}', \
+        "Tag override should still be active after PUT"
+    assert data['processor_config_restock_diff'].get('in_stock_processing') == 'in_stock_only', \
+        "Tag config should still win after PUT attempted to change watch-level config"
 
     delete_all_watches(client)
 

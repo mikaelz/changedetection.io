@@ -29,7 +29,7 @@ def _check_cascading_vars(datastore, var_name, watch):
     v = watch.get(var_name)
     if v and not watch.get('notification_muted'):
         if var_name == 'notification_format' and v == USE_SYSTEM_DEFAULT_NOTIFICATION_FORMAT_FOR_WATCH:
-            return datastore.data['settings']['application'].get('notification_format')
+            return datastore.data['settings']['application'].get('notification_format') or default_notification_format
 
         return v
 
@@ -88,6 +88,35 @@ class FormattableTimestamp(str):
             return self._dt.isoformat()
 
 
+class FormattableExtract(str):
+    """
+    A str subclass that holds only the extracted changed fragments from a diff.
+    Used for {{diff_changed_from}} and {{diff_changed_to}} tokens.
+
+        {{ diff_changed_from }}   → old value(s) only, e.g. "$99.99"
+        {{ diff_changed_to }}     → new value(s) only, e.g. "$109.99"
+
+    Multiple changed fragments are joined with newlines.
+    Being a str subclass means it is natively JSON serializable.
+    """
+    def __new__(cls, prev_snapshot, current_snapshot, extract_fn, escape_output=False):
+        if prev_snapshot or current_snapshot:
+            from changedetectionio import diff as diff_module
+            # word_diff=True is required — placemarker extraction regexes only exist in word-diff output
+            raw = diff_module.render_diff(prev_snapshot or '', current_snapshot or '', word_diff=True)
+            extracted = extract_fn(raw)
+        else:
+            extracted = ''
+        if escape_output and extracted:
+            # Placemarkers (@removed_PLACEMARKER_OPEN etc) contain no HTML chars,
+            # so html_escape leaves them intact — they still get swapped to <span>
+            # tags later by apply_service_tweaks. See GHSA-q8xq-qg4x-wphg.
+            from markupsafe import escape as html_escape
+            extracted = str(html_escape(extracted))
+        instance = super().__new__(cls, extracted)
+        return instance
+
+
 class FormattableDiff(str):
     """
     A str subclass representing a rendered diff. As a plain string it renders
@@ -105,16 +134,23 @@ class FormattableDiff(str):
 
     Being a str subclass means it is natively JSON serializable.
     """
-    def __new__(cls, prev_snapshot, current_snapshot, **base_kwargs):
+    def __new__(cls, prev_snapshot, current_snapshot, escape_output=False, **base_kwargs):
         if prev_snapshot or current_snapshot:
             from changedetectionio import diff as diff_module
             rendered = diff_module.render_diff(prev_snapshot, current_snapshot, **base_kwargs)
         else:
             rendered = ''
+        if escape_output and rendered:
+            # Placemarkers (@removed_PLACEMARKER_OPEN etc) contain no HTML chars,
+            # so html_escape leaves them intact — they still get swapped to <span>
+            # tags later by apply_service_tweaks. See GHSA-q8xq-qg4x-wphg.
+            from markupsafe import escape as html_escape
+            rendered = str(html_escape(rendered))
         instance = super().__new__(cls, rendered)
         instance._prev = prev_snapshot
         instance._current = current_snapshot
         instance._base_kwargs = base_kwargs
+        instance._escape_output = escape_output
         return instance
 
     def __call__(self, lines=None, added_only=False, removed_only=False, context=0,
@@ -140,6 +176,10 @@ class FormattableDiff(str):
         if lines is not None:
             result = '\n'.join(result.splitlines()[:int(lines)])
 
+        if self._escape_output and result:
+            from markupsafe import escape as html_escape
+            result = str(html_escape(result))
+
         return result
 
 
@@ -161,7 +201,11 @@ class NotificationContextData(dict):
             'diff_patch': FormattableDiff('', '', patch_format=True),
             'diff_removed': FormattableDiff('', '', include_added=False),
             'diff_removed_clean': FormattableDiff('', '', include_added=False, include_change_type_prefix=False),
+            'diff_changed_from': FormattableExtract('', '', extract_fn=lambda x: x),
+            'diff_changed_to': FormattableExtract('', '', extract_fn=lambda x: x),
             'diff_url': None,
+            # Always the raw +/- diff regardless of LLM summary override (populated in handler.py from {{diff}})
+            'raw_diff': FormattableDiff('', ''),
             'markup_text_links_to_html_links': False, # If automatic conversion of plaintext to HTML should happen
             'notification_timestamp': time.time(),
             'prev_snapshot': None,
@@ -170,6 +214,8 @@ class NotificationContextData(dict):
             'timestamp_from': None,
             'timestamp_to': None,
             'triggered_text': None,
+            'llm_summary': None,     # AI plain-English summary of what changed (requires AI intent to be configured)
+            'llm_intent': None,      # The intent that was evaluated (watch-level or inherited from tag)
             'uuid': 'XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX',  # Converted to 'watch_uuid' in create_notification_parameters
             'watch_mime_type': None,
             'watch_tag': None,
@@ -209,7 +255,7 @@ class NotificationContextData(dict):
 
         super().__setitem__(key, value)
 
-def add_rendered_diff_to_notification_vars(notification_scan_text:str, prev_snapshot:str, current_snapshot:str, word_diff:bool):
+def add_rendered_diff_to_notification_vars(notification_scan_text:str, prev_snapshot:str, current_snapshot:str, word_diff:bool, escape_output:bool=False):
     """
     Efficiently renders only the diff placeholders that are actually used in the notification text.
 
@@ -222,6 +268,9 @@ def add_rendered_diff_to_notification_vars(notification_scan_text:str, prev_snap
         prev_snapshot: Previous version of content for diff comparison
         current_snapshot: Current version of content for diff comparison
         word_diff: Whether to use word-level (True) or line-level (False) diffing
+        escape_output: If True, the rendered diff output is HTML-escaped. Used for HTML-format
+            notifications so attacker-controlled page content can't inject live markup.
+            Both the cached str representation and the result of {{ diff(...) }} calls are escaped.
 
     Returns:
         dict: Only the diff placeholders that were found in notification_scan_text, with rendered content
@@ -244,16 +293,27 @@ def add_rendered_diff_to_notification_vars(notification_scan_text:str, prev_snap
         'diff_removed_clean': {'word_diff': word_diff, 'include_added': False, 'include_change_type_prefix': False},
     }
 
+    from changedetectionio.diff import extract_changed_from, extract_changed_to
+    extract_specs = {
+        'diff_changed_from': extract_changed_from,
+        'diff_changed_to':   extract_changed_to,
+    }
+
     ret = {}
     rendered_count = 0
-    # Only create FormattableDiff objects for diff keys actually used in the notification text
+    # Only create FormattableDiff/FormattableExtract objects for diff keys actually used in the notification text
     for key in NotificationContextData().keys():
-        if key.startswith('diff') and key in diff_specs:
-            # Check if this placeholder is actually used in the notification text
-            pattern = rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![A-Za-z0-9_])"
-            if re.search(pattern, notification_scan_text, re.IGNORECASE):
-                ret[key] = FormattableDiff(prev_snapshot, current_snapshot, **diff_specs[key])
-                rendered_count += 1
+        if not key.startswith('diff'):
+            continue
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![A-Za-z0-9_])"
+        if not re.search(pattern, notification_scan_text, re.IGNORECASE):
+            continue
+        if key in diff_specs:
+            ret[key] = FormattableDiff(prev_snapshot, current_snapshot, escape_output=escape_output, **diff_specs[key])
+            rendered_count += 1
+        elif key in extract_specs:
+            ret[key] = FormattableExtract(prev_snapshot, current_snapshot, extract_fn=extract_specs[key], escape_output=escape_output)
+            rendered_count += 1
 
     if rendered_count:
         logger.trace(f"Rendered {rendered_count} diff placeholder(s) {sorted(ret.keys())} in {time.time() - now:.3f}s")
@@ -375,6 +435,11 @@ class NotificationService:
         n_object['notification_body'] = _check_cascading_vars(self.datastore,'notification_body', watch)
         n_object['notification_format'] = _check_cascading_vars(self.datastore,'notification_format', watch)
 
+        # Attach LLM results so notification tokens render correctly
+        n_object['_llm_result'] = watch.get('_llm_result')
+        n_object['_llm_intent'] = watch.get('_llm_intent', '')
+        n_object['_llm_change_summary'] = watch.get('_llm_change_summary', '')
+
         # (Individual watch) Only prepare to notify if the rules above matched
         queued = False
         if n_object and n_object.get('notification_urls'):
@@ -414,7 +479,7 @@ Thanks - Your omniscient changedetection.io installation.
             'notification_body': body,
             'notification_format': _check_cascading_vars(self.datastore, 'notification_format', watch),
         })
-        n_object['markup_text_links_to_html_links'] = n_object.get('notification_format').startswith('html')
+        n_object['markup_text_links_to_html_links'] = (n_object.get('notification_format') or '').startswith('html')
 
         if len(watch['notification_urls']):
             n_object['notification_urls'] = watch['notification_urls']
@@ -461,9 +526,9 @@ Thanks - Your omniscient changedetection.io installation.
         n_object = NotificationContextData({
             'notification_title': f"Changedetection.io - Alert - Browser step at position {step} could not be run",
             'notification_body': body,
-            'notification_format': self._check_cascading_vars('notification_format', watch),
+            'notification_format': _check_cascading_vars(self.datastore, 'notification_format', watch),
         })
-        n_object['markup_text_links_to_html_links'] = n_object.get('notification_format').startswith('html')
+        n_object['markup_text_links_to_html_links'] = (n_object.get('notification_format') or '').startswith('html')
 
         if len(watch['notification_urls']):
             n_object['notification_urls'] = watch['notification_urls']

@@ -414,7 +414,7 @@ def _jinja2_filter_sanitize_tag_class(tag_title):
     return sanitized if sanitized else 'tag'
 
 # Import login_optionally_required from auth_decorator
-from changedetectionio.auth_decorator import login_optionally_required
+from changedetectionio.auth_decorator import SHARED_DIFF_READ_ONLY_ENDPOINTS, login_optionally_required
 
 # When nobody is logged in Flask-Login's current_user is set to an AnonymousUser object.
 class User(flask_login.UserMixin):
@@ -522,6 +522,11 @@ def changedetection_app(config=None, datastore_o=None):
         available_languages=available_languages
     )
 
+    @app.context_processor
+    def inject_llm_features_disabled():
+        from changedetectionio.llm.evaluator import is_llm_features_disabled
+        return dict(llm_features_disabled=is_llm_features_disabled())
+
     # Set up a request hook to check authentication for all routes
     @app.before_request
     def check_authentication():
@@ -541,7 +546,7 @@ def changedetection_app(config=None, datastore_o=None):
             # Permitted
             elif request.endpoint and 'login' in request.endpoint:
                 return None
-            elif request.endpoint and 'diff_history_page' in request.endpoint and datastore.data['settings']['application'].get('shared_diff_access'):
+            elif request.endpoint in SHARED_DIFF_READ_ONLY_ENDPOINTS and datastore.data['settings']['application'].get('shared_diff_access'):
                 return None
             elif request.method in flask_login.config.EXEMPT_METHODS:
                 return None
@@ -980,6 +985,11 @@ def changedetection_app(config=None, datastore_o=None):
                     "queue_size": update_q.qsize(),
                     "queued_data": all_queued
                 })
+
+    if strtobool(os.getenv('HISTORY_SNAPSHOT_FILE_ALLOW_OUTSIDE_WATCH_DATADIR', 'False')):
+        logger.warning("SECURITY WARNING: HISTORY_SNAPSHOT_FILE_ALLOW_OUTSIDE_WATCH_DATADIR is enabled — "
+                       "snapshot reads are NOT confined to the watch data directory. "
+                       "This disables protection against path traversal via restored backups (GHSA-8757-69j2-hx56).")
 
     # Start the async workers during app initialization
     # Can be overridden by ENV or use the default settings

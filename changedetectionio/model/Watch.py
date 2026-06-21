@@ -465,22 +465,21 @@ class model(EntityPersistenceMixin, watch_base):
                     if ',' in i:
                         k, v = i.strip().split(',', 2)
 
-                        # The index history could contain a relative path, so we need to make the fullpath
-                        # so that python can read it
-                        # Cross-platform: check for any path separator (works on Windows and Unix)
-                        if os.sep not in v and '/' not in v and '\\' not in v:
-                            # Relative filename only, no path separators
-                            v = os.path.join(self.data_dir, v)
-                        else:
-                            # It's possible that they moved the datadir on older versions
-                            # So the snapshot exists but is in a different path
-                            # Cross-platform: use os.path.basename instead of split('/')
-                            snapshot_fname = os.path.basename(v)
-                            proposed_new_path = os.path.join(self.data_dir, snapshot_fname)
-                            if not os.path.exists(v) and os.path.exists(proposed_new_path):
-                                v = proposed_new_path
+                        # Always resolve history entries to within the watch's own data directory.
+                        # Entries restored from backup could contain absolute or traversal paths —
+                        # never trust them. Use realpath to also block symlink-based escapes.
+                        safe_data_dir = os.path.realpath(self.data_dir)
+                        snapshot_fname = os.path.basename(v.strip())
+                        resolved_path = os.path.realpath(os.path.join(self.data_dir, snapshot_fname))
 
-                        tmp_history[k] = v
+                        if not resolved_path.startswith(safe_data_dir + os.sep) and resolved_path != safe_data_dir:
+                            logger.warning(f"Skipping unsafe history entry for {self.get('uuid')}: {v!r}")
+                            continue
+
+                        if not os.path.exists(resolved_path):
+                            continue
+
+                        tmp_history[k] = resolved_path
 
         if len(tmp_history):
             self.__newest_history_key = list(tmp_history.keys())[-1]
@@ -562,6 +561,15 @@ class model(EntityPersistenceMixin, watch_base):
 
         if not filepath:
             filepath = self.history[timestamp]
+
+        # Confine every read to the watch's own data directory — defence in depth
+        # against any path that bypasses the history parser (e.g. direct filepath= callers).
+        # Set HISTORY_SNAPSHOT_FILE_ALLOW_OUTSIDE_WATCH_DATADIR=true to disable (not recommended).
+        if self.data_dir and not strtobool(os.getenv('HISTORY_SNAPSHOT_FILE_ALLOW_OUTSIDE_WATCH_DATADIR', 'False')):
+            safe_data_dir = os.path.realpath(self.data_dir)
+            resolved = os.path.realpath(filepath)
+            if not (resolved.startswith(safe_data_dir + os.sep) or resolved == safe_data_dir):
+                raise PermissionError(f"Snapshot path {filepath!r} is outside the watch data directory")
 
         # Check if binary file (image, PDF, etc.)
         # Binary files are NEVER saved with .br compression, only text files are
@@ -798,24 +806,50 @@ class model(EntityPersistenceMixin, watch_base):
         # Also in the case that the file didnt exist
         return True
 
-    def bump_favicon(self, url, favicon_base_64: str) -> None:
+    def bump_favicon(self, url, favicon_base_64: str, mime_type: str = None) -> None:
         from urllib.parse import urlparse
         import base64
         import binascii
-        decoded = None
+        import re
 
-        if url:
+        MAX_FAVICON_BYTES = 1 * 1024 * 1024  # 1 MB
+
+        MIME_TO_EXT = {
+            'image/png': 'png',
+            'image/x-icon': 'ico',
+            'image/vnd.microsoft.icon': 'ico',
+            'image/jpeg': 'jpg',
+            'image/gif': 'gif',
+            'image/svg+xml': 'svg',
+            'image/webp': 'webp',
+            'image/bmp': 'bmp',
+        }
+
+        extension = None
+
+        # If the caller already resolved the MIME type (e.g. from blob.type or a data URI),
+        # use that directly — it's more reliable than guessing from a URL path.
+        if mime_type:
+            extension = MIME_TO_EXT.get(mime_type.lower().split(';')[0].strip(), None)
+
+        # Fall back to extracting extension from URL path, unless it's a data URI.
+        if not extension and url and not url.startswith('data:'):
             try:
                 parsed = urlparse(url)
                 filename = os.path.basename(parsed.path)
-                (base, extension) = filename.lower().strip().rsplit('.', 1)
+                (_base, ext) = filename.lower().strip().rsplit('.', 1)
+                extension = ext
             except ValueError:
-                logger.error(f"UUID: {self.get('uuid')} Cant work out file extension from '{url}'")
-                return None
-        else:
-            # Assume favicon.ico
-            base = "favicon"
-            extension = "ico"
+                logger.warning(f"UUID: {self.get('uuid')} Cant work out file extension from '{url}', defaulting to ico")
+
+        # Handle data URIs: extract MIME type from the URI itself when not already known
+        if not extension and url and url.startswith('data:'):
+            m = re.match(r'^data:([^;]+);base64,', url)
+            if m:
+                extension = MIME_TO_EXT.get(m.group(1).lower(), None)
+
+        if not extension:
+            extension = 'ico'
 
         fname = os.path.join(self.data_dir, f"favicon.{extension}")
 
@@ -824,22 +858,27 @@ class model(EntityPersistenceMixin, watch_base):
             decoded = base64.b64decode(favicon_base_64, validate=True)
         except (binascii.Error, ValueError) as e:
             logger.warning(f"UUID: {self.get('uuid')} FavIcon save data (Base64) corrupt? {str(e)}")
-        else:
-            if decoded:
-                try:
-                    with open(fname, 'wb') as f:
-                        f.write(decoded)
+            return None
 
-                    # Invalidate module-level favicon filename cache for this watch
-                    _FAVICON_FILENAME_CACHE.pop(self.data_dir, None)
+        if len(decoded) > MAX_FAVICON_BYTES:
+            logger.warning(f"UUID: {self.get('uuid')} Favicon too large ({len(decoded)} bytes), skipping")
+            return None
 
-                    # A signal that could trigger the socket server to update the browser also
-                    watch_check_update = signal('watch_favicon_bump')
-                    if watch_check_update:
-                        watch_check_update.send(watch_uuid=self.get('uuid'))
+        try:
+            with open(fname, 'wb') as f:
+                f.write(decoded)
 
-                except Exception as e:
-                    logger.warning(f"UUID: {self.get('uuid')} error saving FavIcon to {fname} - {str(e)}")
+            # Invalidate module-level favicon filename cache for this watch
+            _FAVICON_FILENAME_CACHE.pop(self.data_dir, None)
+
+            # A signal that could trigger the socket server to update the browser also
+            watch_check_update = signal('watch_favicon_bump')
+            if watch_check_update:
+                watch_check_update.send(watch_uuid=self.get('uuid'))
+
+        except Exception as e:
+            logger.warning(f"UUID: {self.get('uuid')} error saving FavIcon to {fname} - {str(e)}")
+            return None
 
         # @todo - Store some checksum and only write when its different
         logger.debug(f"UUID: {self.get('uuid')} updated favicon to at {fname}")
@@ -970,6 +1009,40 @@ class model(EntityPersistenceMixin, watch_base):
         return False
 
 
+    @staticmethod
+    def _llm_summary_prompt_hash(prompt: str) -> str:
+        """8-char hex hash of the prompt — used to detect when the prompt changes."""
+        import hashlib
+        return hashlib.md5(prompt.encode('utf-8', errors='replace')).hexdigest()[:8]
+
+    def get_llm_diff_summary(self, from_version, to_version, prompt: str = '') -> str:
+        """Return the cached AI Change Summary for this from→to + prompt combination, or ''.
+
+        The prompt hash is embedded in the filename so that a changed prompt
+        automatically produces a cache miss and triggers regeneration.
+        """
+        prompt_hash = self._llm_summary_prompt_hash(prompt)
+        fname = os.path.join(self.data_dir, f'change-summary-{from_version}-to-{to_version}-{prompt_hash}.txt')
+        if not os.path.isfile(fname):
+            logger.debug(f"LLM cached diff summary '{fname}' NOT found")
+            return ''
+        with open(fname, 'r', encoding='utf-8') as f:
+            logger.debug(f"LLM cached diff summary '{fname}' FOUND")
+            return f.read().strip()
+
+    def save_llm_diff_summary(self, summary: str, from_version, to_version, prompt: str = ''):
+        """Persist the AI Change Summary keyed by version pair + prompt hash."""
+        self.ensure_data_dir_exists()
+        prompt_hash = self._llm_summary_prompt_hash(prompt)
+        fname = os.path.join(self.data_dir, f'change-summary-{from_version}-to-{to_version}-{prompt_hash}.txt')
+        tmp = fname + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(summary)
+            os.replace(tmp, fname)
+        except OSError as e:
+            logger.warning(f"Could not write LLM summary cache {fname}: {e}")
+
     def pause(self):
         self['paused'] = True
 
@@ -993,6 +1066,7 @@ class model(EntityPersistenceMixin, watch_base):
         Prepare watch data for commit.
 
         Excludes processor_config_* keys (stored in separate files).
+        Excludes __-prefixed keys (transient in-memory state — must not persist to disk).
         Normalizes browser_steps to empty list if no meaningful steps.
         """
         import copy
@@ -1006,8 +1080,11 @@ class model(EntityPersistenceMixin, watch_base):
         else:
             snapshot = dict(self)
 
-        # Exclude processor config keys (stored separately)
-        watch_dict = {k: copy.deepcopy(v) for k, v in snapshot.items() if not k.startswith('processor_config_')}
+        # Exclude processor config keys (stored separately) and __-prefixed transient keys
+        watch_dict = {
+            k: copy.deepcopy(v) for k, v in snapshot.items()
+            if not k.startswith('processor_config_') and not k.startswith('__')
+        }
 
         # Normalize browser_steps: if no meaningful steps, save as empty list
         if not self.has_browser_steps:

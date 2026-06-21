@@ -69,7 +69,7 @@
         {% else %}
           {% if new_version_available and not(has_password and not current_user.is_authenticated) %}
             <span id="new-version-text" class="pure-menu-heading">
-              <a href="https://changedetection.io">A new version is available</a>
+              <a href="https://changedetection.io">{{ _('A new version is available') }}</a>
             </span>
           {% endif %}
         {% endif %}
@@ -235,7 +235,7 @@
             {% if session['share-link'] %}
               <ul class="messages with-share-link">
                 <li class="message">
-                  Share this link:
+                  {{ _('Share this link:') }}
                   <span id="share-link">{{ session['share-link'] }}</span>
                   <img style="height: 1em; display: inline-block" src="{{url_for('static_content', group='images', filename='copy.svg')}}" >
                 </li>
@@ -281,6 +281,22 @@
       </div>
     </dialog>
 
+    {% if not llm_features_disabled %}
+    <!-- LLM Not Configured Modal -->
+    <dialog id="llm-not-configured-modal" class="modal-dialog" aria-labelledby="llm-not-configured-modal-title">
+      <div class="modal-header">
+        <h2 class="modal-title" id="llm-not-configured-modal-title">{{ _('AI / LLM not configured') }}</h2>
+      </div>
+      <div class="modal-body">
+        <p>{{ _('LLM-powered summaries are not yet enabled. Configure an AI provider in Settings to get started.') }}</p>
+        <p><a href="{{ url_for('settings.settings_page') }}#ai" class="pure-button pure-button-primary">{{ _('Go to AI / LLM Settings') }}</a></p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="pure-button" id="close-llm-not-configured-modal">{{ _('Close') }}</button>
+      </div>
+    </dialog>
+    {% endif %}
+
     <!-- Search Modal -->
     {% if current_user.is_authenticated or not has_password %}
     <dialog id="search-modal" class="modal-dialog" aria-labelledby="search-modal-title">
@@ -290,7 +306,7 @@
       <div class="modal-body">
         <form id="search-form" method="GET">
           <div class="pure-control-group">
-            <label for="search-modal-input">{{ _('URL or Title') }}{% if active_tag_uuid %} {{ _('in') }} '{{ active_tag.title }}'{% endif %}</label>
+            <label for="search-modal-input">{% if active_tag_uuid %}{{ _("URL or Title in '%(title)s'", title=active_tag.title) }}{% else %}{{ _('URL or Title') }}{% endif %}</label>
             <input id="search-modal-input" class="m-d" name="q" placeholder="{{ _('Enter search term...') }}" required type="text" value="" autofocus>
             <input name="tags" type="hidden" value="{% if active_tag_uuid %}{{active_tag_uuid}}{% endif %}">
           </div>

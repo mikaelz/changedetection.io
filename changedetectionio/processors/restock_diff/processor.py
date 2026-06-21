@@ -486,8 +486,7 @@ class perform_site_check(difference_detection_processor):
         has_price = itemprop_availability.get('price') is not None
         has_availability = itemprop_availability.get('availability') is not None
 
-        # @TODO !!! some setting like "Use as fallback" or "always use", "t
-        if not (has_price and has_availability) or True:
+        if not (has_price and has_availability):
             from changedetectionio.pluggy_interface import get_itemprop_availability_from_plugin
             fetcher_name = watch.get('fetch_backend', 'html_requests')
 
@@ -506,9 +505,23 @@ class perform_site_check(difference_detection_processor):
             # Try plugin override - plugins can decide if they support this fetcher
             if fetcher_name:
                 logger.debug(f"Calling extra plugins for getting item price/availability (fetcher: {fetcher_name})")
-                plugin_availability = get_itemprop_availability_from_plugin(self.fetcher.content, fetcher_name, self.fetcher, watch.link)
+                from changedetectionio.llm.evaluator import resolve_intent
+                _llm_intent, _ = resolve_intent(watch, self.datastore)
+                plugin_availability = get_itemprop_availability_from_plugin(self.fetcher.content, fetcher_name, self.fetcher, watch.link, llm_intent=_llm_intent or None)
 
                 if plugin_availability:
+                    # Extract and strip LLM token metadata before using as Restock data
+                    _plugin_tokens = plugin_availability.pop('_tokens', 0)
+                    _plugin_input_tokens = plugin_availability.pop('_input_tokens', 0)
+                    _plugin_output_tokens = plugin_availability.pop('_output_tokens', 0)
+                    _plugin_model = plugin_availability.pop('_model', '')
+
+                    # Update per-watch token counters directly on the watch (same
+                    # pattern as evaluator.py) so they're committed when update_watch runs
+                    if _plugin_tokens:
+                        watch['llm_last_tokens_used'] = _plugin_tokens
+                        watch['llm_tokens_used_cumulative'] = (watch.get('llm_tokens_used_cumulative') or 0) + _plugin_tokens
+
                     # Plugin provided better data, use it
                     plugin_has_price = plugin_availability.get('price') is not None
                     plugin_has_availability = plugin_availability.get('availability') is not None
@@ -551,10 +564,15 @@ class perform_site_check(difference_detection_processor):
         # Main detection method
         fetched_md5 = None
 
-        # store original price if not set
-        if itemprop_availability and itemprop_availability.get('price') and not itemprop_availability.get('original_price'):
-            itemprop_availability['original_price'] = itemprop_availability.get('price')
-            update_obj['restock']["original_price"] = itemprop_availability.get('price')
+        # Record this check's price as 'last_price'. The freshly scraped itemprop never carries
+        # last_price, so this is (re)set on every check - i.e. last_price always holds the price
+        # from the most recent check, and at comparison time below it is the PREVIOUS check's price.
+        if itemprop_availability and itemprop_availability.get('price') and not itemprop_availability.get('last_price'):
+            itemprop_availability['last_price'] = itemprop_availability.get('price')
+            update_obj['restock']["last_price"] = itemprop_availability.get('price')
+            logger.debug(
+                f"{watch.get('uuid')} Updating price - setting 'last_price' to '{itemprop_availability.get('price')}' "
+                f"(previously stored 'last_price' was '{(watch.get('restock') or {}).get('last_price')}'). ")
 
         if not self.fetcher.instock_data and not itemprop_availability.get('availability') and not itemprop_availability.get('price'):
             raise ProcessorException(
@@ -604,9 +622,13 @@ class perform_site_check(difference_detection_processor):
 
         if restock_settings.get('follow_price_changes') and watch.get('restock') and update_obj.get('restock') and update_obj['restock'].get('price'):
             price = float(update_obj['restock'].get('price'))
-            # Default to current price if no previous price found
-            if watch['restock'].get('original_price'):
-                previous_price = float(watch['restock'].get('original_price'))
+            # Compare against last_price (the price from the previous check)
+            if watch['restock'].get('last_price'):
+                previous_price = float(watch['restock'].get('last_price'))
+                logger.debug(
+                    f"{watch.get('uuid')} Comparing NEW price '{price}' against stored 'last_price' '{previous_price}' "
+                    f"(watch's stored current price was '{(watch.get('restock') or {}).get('price')}') -> "
+                    f"price {'CHANGED' if price != previous_price else 'unchanged'}")
                 # It was different, but negate it further down
                 if price != previous_price:
                     changed_detected = True
@@ -629,11 +651,14 @@ class perform_site_check(difference_detection_processor):
                         else:
                             logger.trace(f"{watch.get('uuid')} {price} is between {min_limit} and {max_limit}, continuing normal comparison")
 
-                    # Price comparison by %
-                    if watch['restock'].get('original_price') and changed_detected and restock_settings.get('price_change_threshold_percent'):
-                        previous_price = float(watch['restock'].get('original_price'))
+                    # Price comparison by % - against last_price (the previous check's price)
+                    if watch['restock'].get('last_price') and changed_detected and restock_settings.get('price_change_threshold_percent'):
+                        previous_price = float(watch['restock'].get('last_price'))
                         pc = float(restock_settings.get('price_change_threshold_percent'))
                         change = abs((price - previous_price) / previous_price * 100)
+                        logger.debug(
+                            f"{watch.get('uuid')} % threshold check - comparing NEW price '{price}' against stored "
+                            f"'last_price' '{previous_price}' = {change:.3f}% change (threshold {pc}%)")
                         if change and change <= pc:
                             logger.debug(f"{watch.get('uuid')} Override change-detected to FALSE because % threshold ({pc}%) was {change:.3f}%")
                             changed_detected = False

@@ -186,7 +186,13 @@ class watch_base(dict):
             'consecutive_filter_failures': 0,  # Every time the CSS/xPath filter cannot be located, reset when all is fine.
             'content-type': None,
             'date_created': None,
+            'extract_lines_containing': [],  # Keep only lines containing these substrings (plain text, case-insensitive)
             'extract_text': [],  # Extract text by regex after filters
+            # LLM intent-based evaluation
+            'llm_intent': '',                # Plain-English description of what the user cares about (change filter)
+            'llm_change_summary': '',        # Prompt for AI Change Summary — replaces {{ diff }} in notifications
+            'llm_prefilter': None,           # CSS selector derived at setup time (semantic only, e.g. "footer")
+            'llm_evaluation_cache': {},      # {sha256(intent+diff): {important, summary}} - evaluated once, cached
             'fetch_backend': 'system',  # plaintext, playwright etc
             'fetch_time': 0.0,
             'filter_failure_notification_send': strtobool(os.getenv('FILTER_FAILURE_NOTIFICATION_SEND_DEFAULT', 'True')),
@@ -329,20 +335,22 @@ class watch_base(dict):
         if self.__watch_was_edited:
             return  # Already marked as edited
 
+        # __-prefixed keys are transient in-memory state (e.g. __check_status set by
+        # set_watch_minitext_status). They never persist to disk and must not trigger
+        # the edited flag — otherwise just observing a check in progress would force
+        # the next run to bypass the unchanged-content skip.
+        if isinstance(key, str) and key.startswith('__'):
+            return
+
         # Import from shared schema utilities (no circular dependency)
-        from .schema_utils import get_readonly_watch_fields
-        readonly_fields = get_readonly_watch_fields()
+        from .schema_utils import get_readonly_watch_fields, SYSTEM_MANAGED_NON_SPEC_FIELDS
 
-        # Additional system-managed fields not in OpenAPI spec (yet)
-        # These are set by processors/workers and should not trigger edited flag
-        additional_system_fields = {
-            'last_check_status',  # Set by processors
-            'restock',  # Set by restock processor
-            'last_viewed',  # Set by mark_all_viewed endpoint
-        }
-
-        # Only mark as edited if this is a user-writable field
-        if key not in readonly_fields and key not in additional_system_fields:
+        # `last_viewed` is set internally by mark_all_viewed and shouldn't flag the watch as
+        # edited, but is not in SYSTEM_MANAGED_NON_SPEC_FIELDS because it IS user-writable via
+        # the UpdateWatch schema (the API path).
+        if (key not in get_readonly_watch_fields()
+                and key != 'last_viewed'
+                and key not in SYSTEM_MANAGED_NON_SPEC_FIELDS):
             self.__watch_was_edited = True
 
     def __setitem__(self, key, value):

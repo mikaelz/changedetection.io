@@ -65,6 +65,9 @@ def notification_format_align_with_apprise(n_format : str):
     :return:
     """
 
+    if not n_format:
+        return NotifyFormat.TEXT.value
+
     if n_format.startswith('html'):
         # Apprise only knows 'html' not 'htmlcolor' etc, which shouldnt matter here
         n_format = NotifyFormat.HTML.value
@@ -259,9 +262,12 @@ def apply_service_tweaks(url, n_body, n_title, requested_output_format):
     elif (url.startswith('discord://') or url.startswith('https://discordapp.com/api/webhooks')
           or url.startswith('https://discord.com/api'))\
             and 'html' in requested_output_format:
-        # Discord doesn't support HTML, replace <br> with newlines
+        # Discord doesn't render HTML — convert markup to plain text equivalents.
+        # &nbsp; is injected upstream to preserve double-spaces for HTML email clients;
+        # Discord displays it as the literal string "&nbsp;" so strip it here.
         n_body = n_body.strip().replace('<br>', '\n')
         n_body = n_body.replace('</br>', '\n')
+        n_body = n_body.replace('&nbsp;', ' ')
         n_body = newline_re.sub('\n', n_body)
 
         # Don't replace placeholders or truncate here - let the custom Discord plugin handle it
@@ -358,8 +364,54 @@ def process_notification(n_object: NotificationContextData, datastore):
         # Should always be false for 'text' mode or its too hard to read
         # But otherwise, this could be some setting
         word_diff=False if requested_output_format_original == 'text' else True,
+        # HTML-format notifications must escape diff content (GHSA-q8xq-qg4x-wphg).
+        # FormattableDiff/Extract escape internally so {{ diff(...) }} stays callable —
+        # the post-Jinja escape loop below would otherwise convert them to plain str.
+        escape_output='html' in requested_output_format,
         )
     )
+
+    # {{ raw_diff }} always holds the actual diff regardless of AI Change Summary
+    n_object['raw_diff'] = n_object.get('diff', '')
+
+    # AI Change Summary: optionally replace {{ diff }} with the AI summary
+    _llm_change_summary = (n_object.get('_llm_change_summary') or '').strip()
+    from changedetectionio.llm.evaluator import get_llm_settings
+    _override_diff = get_llm_settings(datastore).override_diff_with_summary
+    if _llm_change_summary and _override_diff:
+        n_object['diff'] = _llm_change_summary
+
+    # Lazily populate llm_summary / llm_intent if used in notification template
+    scan_text = n_object.get('notification_body', '') + n_object.get('notification_title', '')
+    if 'llm_summary' in scan_text or 'llm_intent' in scan_text or 'raw_diff' in scan_text:
+        n_object['llm_summary'] = _llm_change_summary or (n_object.get('_llm_result') or {}).get('summary', '')
+        n_object['llm_intent'] = n_object.get('_llm_intent', '')
+
+    # Escape diff/snapshot variables before Jinja renders them into an HTML notification.
+    # GHSA-q8xq-qg4x-wphg: inscriptis decodes HTML entities when converting text/html
+    # pages to snapshot text, so a page that visibly displays "&lt;a href...&gt;" yields
+    # literal "<a href...>" in the snapshot — which would otherwise render as live
+    # markup in HTML emails / Telegram (parse_mode=html) / Discord embeds, letting a
+    # watched page inject phishing links into the operator's notification channel.
+    # Also covers #3529 — raw '<' chars from text/plain pages breaking HTML email layout.
+    # The operator's own template HTML (e.g. <a href="{{watch_url}}">) is outside the
+    # variable values so it stays untouched. Diff placemarkers contain no HTML chars,
+    # so they survive escape and are still replaced with <span> tags later.
+    if 'html' in requested_output_format:
+        from markupsafe import escape as html_escape
+        from changedetectionio.notification_service import FormattableDiff, FormattableExtract
+        _page_content_keys = {'raw_diff', 'current_snapshot', 'prev_snapshot', 'triggered_text'}
+        for key in [k for k in notification_parameters if k.startswith('diff') or k in _page_content_keys]:
+            value = notification_parameters.get(key)
+            if not value:
+                continue
+            # FormattableDiff / FormattableExtract are callable str subclasses — {{ diff(lines=5) }}
+            # etc. relies on __call__. Wrapping them with str(html_escape(...)) here would lose
+            # __call__ and break those tokens. They escape internally via escape_output=True
+            # (set by add_rendered_diff_to_notification_vars above) for both __str__ and __call__.
+            if isinstance(value, (FormattableDiff, FormattableExtract)):
+                continue
+            notification_parameters[key] = str(html_escape(str(value)))
 
     with (apprise.LogCapture(level=apprise.logging.DEBUG) as logs):
         for url in n_object['notification_urls']:
@@ -377,13 +429,6 @@ def process_notification(n_object: NotificationContextData, datastore):
 
             logger.info(f">> Process Notification: AppRise start notifying '{url}'")
             url = jinja_render(template_str=url, **notification_parameters)
-
-            # If it's a plaintext document, and they want HTML type email/alerts, so it needs to be escaped
-            watch_mime_type = n_object.get('watch_mime_type')
-            if watch_mime_type and 'text/' in watch_mime_type.lower() and not 'html' in watch_mime_type.lower():
-                if 'html' in requested_output_format:
-                    from markupsafe import escape
-                    n_body = str(escape(n_body))
 
             if 'html' in requested_output_format:
                 # Since the n_body is always some kind of text from the 'diff' engine, attempt to preserve whitespaces that get sent to the HTML output

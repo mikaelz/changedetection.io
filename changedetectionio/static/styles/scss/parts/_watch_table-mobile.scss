@@ -47,12 +47,12 @@ $grid-gap: 0.5rem;
 
     .last-checked::before {
       color: var(--color-text);
-      content: "Last Checked ";
+      content: attr(data-label) " ";
     }
 
     .last-changed::before {
       color: var(--color-text);
-      content: "Last Changed ";
+      content: attr(data-label) " ";
     }
 
     /* Force table to not be like tables anymore */
@@ -179,5 +179,11 @@ $grid-gap: 0.5rem;
   }
   .pure-table td {
     padding: 3px !important;
+  }
+}
+
+@media (min-width: 768px) {
+  .watch-table thead tr th .hide-on-desktop {
+    display: none;
   }
 }

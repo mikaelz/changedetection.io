@@ -743,7 +743,7 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
                 current_watch_count = len(self.__data['watching'])
                 if current_watch_count >= page_watch_limit:
                     logger.error(f"Watch limit reached: {current_watch_count}/{page_watch_limit} watches. Cannot add {url}")
-                    flash(gettext("Watch limit reached ({}/{} watches). Cannot add more watches.").format(current_watch_count, page_watch_limit), 'error')
+                    flash(gettext("Watch limit reached ({current}/{limit} watches). Cannot add more watches.").format(current=current_watch_count, limit=page_watch_limit), 'error')
                     return None
             except ValueError:
                 logger.warning(f"Invalid PAGE_WATCH_LIMIT value: {page_watch_limit}, ignoring limit check")
@@ -980,12 +980,20 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
     def get_all_tags_for_watch(self, uuid):
         """This should be in Watch model but Watch doesn't have access to datastore, not sure how to solve that yet"""
         watch = self.data['watching'].get(uuid)
+        if not watch:
+            return {}
 
-        # Should return a dict of full tag info linked by UUID
-        if watch:
-            return dictfilt(self.__data['settings']['application']['tags'], watch.get('tags', []))
+        # Start with manually assigned tags
+        result = dictfilt(self.__data['settings']['application']['tags'], watch.get('tags', []))
 
-        return {}
+        # Additionally include any tag whose url_match_pattern matches this watch's URL
+        watch_url = watch.get('url', '')
+        if watch_url:
+            for tag_uuid, tag in self.__data['settings']['application']['tags'].items():
+                if tag_uuid not in result and tag.matches_url(watch_url):
+                    result[tag_uuid] = tag
+
+        return result
 
     @property
     def extra_browsers(self):

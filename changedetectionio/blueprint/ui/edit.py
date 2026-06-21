@@ -10,10 +10,32 @@ from changedetectionio.store import ChangeDetectionStore
 from changedetectionio.auth_decorator import login_optionally_required
 from changedetectionio.time_handler import is_within_schedule
 from changedetectionio import worker_pool
+from changedetectionio.llm.evaluator import get_llm_config as _get_llm_config
 
 def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMetaData):
     edit_blueprint = Blueprint('ui_edit', __name__, template_folder="../ui/templates")
-    
+
+    def _resolve_llm_group_overrides(watch, datastore) -> dict:
+        """
+        For each LLM field (llm_intent, llm_change_summary): if the watch has no own
+        value but a linked tag does, return {'value': ..., 'group_name': ...} so the
+        edit template can render the textarea as readonly with a group-sourced placeholder.
+        Returns None for each field when the watch has its own value (editable).
+        """
+        result = {'llm_intent': None, 'llm_change_summary': None}
+        for field in ('llm_intent', 'llm_change_summary'):
+            if (watch.get(field) or '').strip():
+                continue  # watch has its own value — editable, no group override
+            for tag_uuid in watch.get('tags', []):
+                tag = datastore.data['settings']['application'].get('tags', {}).get(tag_uuid)
+                if tag and (tag.get(field) or '').strip():
+                    result[field] = {
+                        'value': tag.get(field).strip(),
+                        'group_name': tag.get('title', 'tag'),
+                    }
+                    break
+        return result
+
     def _watch_has_tag_options_set(watch):
         """This should be fixed better so that Tag is some proper Model, a tag is just a Watch also"""
         for tag_uuid, tag in datastore.data['settings']['application'].get('tags', {}).items():
@@ -142,7 +164,7 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
         for p in datastore.extra_browsers:
             form.fetch_backend.choices.append(p)
 
-        form.fetch_backend.choices.append(("system", 'System settings default'))
+        form.fetch_backend.choices.append(("system", gettext('System settings default')))
 
         # form.browser_steps[0] can be assumed that we 'goto url' first
 
@@ -150,7 +172,7 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
             # @todo - Couldn't get setattr() etc dynamic addition working, so remove it instead
             del form.proxy
         else:
-            form.proxy.choices = [('', 'Default')]
+            form.proxy.choices = [('', gettext('Default'))]
             for p in datastore.proxy_list:
                 form.proxy.choices.append(tuple((p, datastore.proxy_list[p]['label'])))
 
@@ -301,7 +323,7 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
                 'extra_classes': ' '.join(c),
                 'extra_notification_token_placeholder_info': datastore.get_unique_notification_token_placeholders_available(),
                 'extra_processor_config': form.extra_tab_content(),
-                'extra_title': f" - Edit - {watch.label}",
+                'extra_title': f" - {gettext('Edit')} - {watch.label}",
                 'form': form,
                 'has_default_notification_urls': True if len(datastore.data['settings']['application']['notification_urls']) else False,
                 'has_extra_headers_file': len(datastore.get_all_headers_in_textfile_for_watch(uuid=uuid)) > 0,
@@ -320,7 +342,15 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
                 'using_global_webdriver_wait': not default['webdriver_delay'],
                 'uuid': uuid,
                 'watch': watch,
-                'capabilities': capabilities
+                'capabilities': capabilities,
+                'auto_applied_tags': {
+                    tag_uuid: tag
+                    for tag_uuid, tag in datastore.data['settings']['application']['tags'].items()
+                    if tag_uuid not in watch.get('tags', []) and tag.matches_url(watch.get('url', ''))
+                },
+                # LLM intent context
+                'llm_configured': bool(_get_llm_config(datastore)),
+                'llm_group_overrides': _resolve_llm_group_overrides(watch, datastore),
             }
 
             included_content = None

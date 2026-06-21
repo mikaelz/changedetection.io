@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 
 from changedetectionio.validate_url import is_safe_valid_url
@@ -12,7 +13,7 @@ from flask_restful import abort, Resource
 from loguru import logger
 import copy
 
-from . import validate_openapi_request, get_readonly_watch_fields
+from . import validate_openapi_request, get_readonly_watch_fields, strip_internal_api_fields
 from ..notification import valid_notification_formats
 from ..notification.handler import newline_re
 
@@ -103,9 +104,31 @@ class Watch(Resource):
         # attr .last_changed will check for the last written text snapshot on change
         watch['last_changed'] = watch_obj.last_changed
         watch['viewed'] = watch_obj.viewed
-        watch['link'] = watch_obj.link,
+        watch['link'] = watch_obj.link
 
-        return watch
+        # Resolved processor config: tag override wins over watch-level config (mirrors restock processor logic)
+        import json
+        _restock_path = os.path.join(watch_obj.data_dir, 'restock_diff.json') if watch_obj.data_dir else None
+        restock_config = {}
+        if _restock_path and os.path.isfile(_restock_path):
+            try:
+                with open(_restock_path, 'r', encoding='utf-8') as _f:
+                    restock_config = json.load(_f).get('restock_diff') or {}
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Failed to read restock_diff.json for watch {uuid}: {e}")
+        restock_source = 'watch'
+        tags = self.datastore.data['settings']['application'].get('tags', {})
+        for tag_uuid in (watch_obj.get('tags') or []):
+            tag = tags.get(tag_uuid, {})
+            if tag.get('overrides_watch'):
+                restock_config = dict(tag.get('processor_config_restock_diff') or {})
+                restock_source = f'tag:{tag_uuid}'
+                break
+        watch['processor_config_restock_diff'] = restock_config
+        watch['processor_config_restock_diff_source'] = restock_source
+
+        # Never expose `__`-prefixed transient/internal fields (e.g. __check_status)
+        return strip_internal_api_fields(watch)
 
     @auth.check_token
     @validate_openapi_request('deleteWatch')
@@ -166,8 +189,10 @@ class Watch(Resource):
         # Handle processor-config-* fields separately (save to JSON, not datastore)
         from changedetectionio import processors
 
-        # Make a mutable copy of request.json for modification
-        json_data = dict(request.json)
+        # Make a mutable copy of request.json for modification.
+        # Silently discard `__`-prefixed transient/internal keys — they are not part of the
+        # public schema and must never be writable (e.g. clients that round-trip GET → PUT).
+        json_data = strip_internal_api_fields(dict(request.json))
 
         # Extract and remove processor config fields from json_data
         processor_config_data = processors.extract_processor_config_from_form_data(json_data)
@@ -254,8 +279,28 @@ class WatchSingleHistory(Resource):
         if request.args.get('html'):
             content = watch.get_fetched_html(timestamp)
             if content:
+                # XSS mitigation (GHSA-cgj8-g98g-4p9x): this is an API endpoint, not a
+                # browser-rendered view. The bytes ARE HTML (that's what the caller asked
+                # for) but a programmatic client doesn't need text/html — and serving
+                # text/html lets attacker-planted <script> in a monitored site execute
+                # in our origin if someone opens the URL in a browser.
+                #
+                # text/plain + explicit utf-8 + nosniff = browser shows inert text,
+                # sniffing can't re-classify it as HTML, an absent charset can't be
+                # auto-detected as UTF-7 (an alternative XSS vector). API clients
+                # still get the raw bytes — they don't care about Content-Type.
                 response = make_response(content, 200)
-                response.mimetype = "text/html"
+                response.headers['Content-Type'] = 'text/plain; charset=utf-8'
+                response.headers['X-Content-Type-Options'] = 'nosniff'
+                # Include the timestamp in the download name so downloading multiple
+                # snapshots doesn't collide. No extension — the stored bytes are
+                # "whatever the fetcher captured" (HTML, JSON, XML, text…), so
+                # claiming .html on the download would be a false content-type label
+                # for non-HTML watches. The user/curl can rename if needed.
+                # Strip to safe filename chars (timestamp is already validated as a
+                # watch.history key — this is defense in depth against header injection).
+                safe_ts = re.sub(r'[^0-9A-Za-z_-]', '', str(timestamp))[:32] or 'snapshot'
+                response.headers['Content-Disposition'] = f'attachment; filename="snapshot-{safe_ts}"'
             else:
                 response = make_response("No content found", 404)
                 response.mimetype = "text/plain"
@@ -422,7 +467,8 @@ class CreateWatch(Resource):
     def post(self):
         """Create a single watch."""
 
-        json_data = request.get_json()
+        # Silently discard `__`-prefixed transient/internal keys (not part of the public schema).
+        json_data = strip_internal_api_fields(request.get_json())
         url = json_data['url'].strip()
 
         if not is_safe_valid_url(url):

@@ -71,6 +71,13 @@ document.addEventListener('DOMContentLoaded', function() {
 {%- for uuid, tag in tags -%}
 {%- if tag and tag.title -%}
 {%- set class_name = tag.title|sanitize_tag_class -%}
+{%- if tag.get('tag_colour') -%}
+.button-tag.tag-{{ class_name }},
+.watch-tag-list.tag-{{ class_name }} {
+  background-color: {{ tag.tag_colour }};
+  color: {{ wcag_text_color(tag.tag_colour) }};
+}
+{%- else -%}
 {%- set colors = generate_tag_colors(tag.title) -%}
 .button-tag.tag-{{ class_name }} {
   background-color: {{ colors['light']['bg'] }};
@@ -92,6 +99,7 @@ html[data-darkmode="true"] .watch-tag-list.tag-{{ class_name }} {
   color: {{ colors['dark']['color'] }};
 }
 {%- endif -%}
+{%- endif -%}
 {%- endfor -%}
 </style>
 <div class="box" id="form-quick-watch-add">
@@ -105,6 +113,16 @@ html[data-darkmode="true"] .watch-tag-list.tag-{{ class_name }} {
                     {{ render_nolabel_field(form.watch_submit_button, title=_("Watch this URL!") ) }}
                     {{ render_nolabel_field(form.edit_and_watch_submit_button, title=_("Edit first then Watch") ) }}
             </div>
+            {% if llm_configured %}
+            <div id="quick-watch-llm-intent" style="display:none; margin-top: 0.5em;">
+                <textarea name="llm_intent"
+                          id="quick_watch_llm_intent"
+                          rows="2"
+                          class="pure-input-1"
+                          placeholder="{{ _('AI — Notify when…') }} {{ llm_intent_watch_placeholder }}"
+                ></textarea>
+            </div>
+            {% endif %}
             <div id="watch-group-tag">
                {{ render_field(form.tags, value=active_tag.title if active_tag_uuid else '', placeholder=_("Watch group / tag"), class="transparent-field") }}
             </div>
@@ -118,6 +136,14 @@ html[data-darkmode="true"] .watch-tag-list.tag-{{ class_name }} {
         </span>
     </form>
 </div>
+{% if llm_configured %}
+<script>
+window.watchOverviewI18n = {
+    generatingSummary: {{ _('Generating summary…')|tojson }},
+    gotoHistory:       {{ _('Goto full history')|tojson }}
+};
+</script>
+{% endif %}
 <div class="box">
     <form class="pure-form" action="{{ url_for('ui.form_watch_list_checkbox_operations') }}" method="POST" id="watch-list-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" >
@@ -137,12 +163,13 @@ html[data-darkmode="true"] .watch-tag-list.tag-{{ class_name }} {
                        data-confirm-type="danger"
                        data-confirm-title="{{ _('Clear Histories') }}"
                        data-confirm-message="{{ _('<p>Are you sure you want to clear history for the selected items?</p><p>This action cannot be undone.</p>') }}"
+                       {# TRANSLATORS: Universally recognized; typically left as-is. dennis-ignore: W302 #}
                        data-confirm-button="{{ _('OK') }}"><i data-feather="trash-2" style="width: 14px; height: 14px; stroke: white; margin-right: 4px;"></i>{{ _('Clear/reset history') }}</button>
         <button class="pure-button button-secondary button-xsmall" style="background: #dd4242;" name="op" value="delete"
                        data-requires-confirm
                        data-confirm-type="danger"
                        data-confirm-title="{{ _('Delete Watches?') }}"
-                       data-confirm-message="{{ _('<p>Are you sure you want to delete the selected watches?</strong></p><p>This action cannot be undone.</p>') }}"
+                       data-confirm-message="{{ _('<p><strong>Are you sure you want to delete the selected watches?</strong></p><p>This action cannot be undone.</p>') }}"
                        data-confirm-button="{{ _('Delete') }}"><i data-feather="trash" style="width: 14px; height: 14px; stroke: white; margin-right: 4px;"></i>{{ _('Delete') }}</button>
     </div>
 
@@ -197,8 +224,8 @@ html[data-darkmode="true"] .watch-tag-list.tag-{{ class_name }} {
              {%- if any_has_restock_price_processor -%}
                 <th>{{ _('Restock & Price') }}</th>
              {%- endif -%}
-                <th><a class="{{ 'active '+link_order if sort_attribute == 'last_checked' else 'inactive' }}" href="{{url_for('watchlist.index', sort='last_checked', order=link_order, tag=active_tag_uuid)}}"><span class="hide-on-mobile">{{ _('Last') }}</span> {{ _('Checked') }} <span class='arrow {{link_order}}'></span></a></th>
-                <th><a class="{{ 'active '+link_order if sort_attribute == 'last_changed' else 'inactive' }}" href="{{url_for('watchlist.index', sort='last_changed', order=link_order, tag=active_tag_uuid)}}"><span class="hide-on-mobile">{{ _('Last') }}</span> {{ _('Changed') }} <span class='arrow {{link_order}}'></span></a></th>
+                <th><a class="{{ 'active '+link_order if sort_attribute == 'last_checked' else 'inactive' }}" href="{{url_for('watchlist.index', sort='last_checked', order=link_order, tag=active_tag_uuid)}}"><span class="hide-on-mobile">{{ _('Last Checked') }}</span><span class="hide-on-desktop">{{ _('Checked') }}</span> <span class='arrow {{link_order}}'></span></a></th>
+                <th><a class="{{ 'active '+link_order if sort_attribute == 'last_changed' else 'inactive' }}" href="{{url_for('watchlist.index', sort='last_changed', order=link_order, tag=active_tag_uuid)}}"><span class="hide-on-mobile">{{ _('Last Changed') }}</span><span class="hide-on-desktop">{{ _('Changed') }}</span> <span class='arrow {{link_order}}'></span></a></th>
                 <th class="empty-cell"></th>
             </tr>
             </thead>
@@ -237,10 +264,10 @@ html[data-darkmode="true"] .watch-tag-list.tag-{{ class_name }} {
                 <td class="inline checkbox-uuid" ><div><input name="uuids"  type="checkbox" value="{{ watch.uuid}} " > <span class="counter-i">{{ loop.index+pagination.skip }}</span></div></td>
                 <td class="inline watch-controls">
                     <div>
-                    <a class="ajax-op state-off pause-toggle" data-op="pause" href="{{url_for('watchlist.index', op='pause', uuid=watch.uuid, tag=active_tag_uuid)}}"><img src="{{url_for('static_content', group='images', filename='pause.svg')}}" alt="Pause checks" title="Pause checks" class="icon icon-pause" ></a>
-                    <a class="ajax-op state-on pause-toggle"  data-op="pause" style="display: none" href="{{url_for('watchlist.index', op='pause', uuid=watch.uuid, tag=active_tag_uuid)}}"><img src="{{url_for('static_content', group='images', filename='play.svg')}}" alt="UnPause checks" title="UnPause checks" class="icon icon-unpause" ></a>
-                    <a class="ajax-op state-off mute-toggle" data-op="mute" href="{{url_for('watchlist.index', op='mute', uuid=watch.uuid, tag=active_tag_uuid)}}"><img src="{{url_for('static_content', group='images', filename='bell-off.svg')}}" alt="Mute notification" title="Mute notification" class="icon icon-mute" ></a>
-                    <a class="ajax-op state-on mute-toggle" data-op="mute"  style="display: none" href="{{url_for('watchlist.index', op='mute', uuid=watch.uuid, tag=active_tag_uuid)}}"><img src="{{url_for('static_content', group='images', filename='bell-off.svg')}}" alt="UnMute notification" title="UnMute notification" class="icon icon-mute" ></a>
+                    <a class="ajax-op state-off pause-toggle" data-op="pause" href="{{url_for('watchlist.index', op='pause', uuid=watch.uuid, tag=active_tag_uuid)}}"><img src="{{url_for('static_content', group='images', filename='pause.svg')}}" alt="{{ _('Pause checks') }}" title="{{ _('Pause checks') }}" class="icon icon-pause" ></a>
+                    <a class="ajax-op state-on pause-toggle"  data-op="pause" style="display: none" href="{{url_for('watchlist.index', op='pause', uuid=watch.uuid, tag=active_tag_uuid)}}"><img src="{{url_for('static_content', group='images', filename='play.svg')}}" alt="{{ _('UnPause checks') }}" title="{{ _('UnPause checks') }}" class="icon icon-unpause" ></a>
+                    <a class="ajax-op state-off mute-toggle" data-op="mute" href="{{url_for('watchlist.index', op='mute', uuid=watch.uuid, tag=active_tag_uuid)}}"><img src="{{url_for('static_content', group='images', filename='bell-off.svg')}}" alt="{{ _('Mute notification') }}" title="{{ _('Mute notification') }}" class="icon icon-mute" ></a>
+                    <a class="ajax-op state-on mute-toggle" data-op="mute"  style="display: none" href="{{url_for('watchlist.index', op='mute', uuid=watch.uuid, tag=active_tag_uuid)}}"><img src="{{url_for('static_content', group='images', filename='bell-off.svg')}}" alt="{{ _('UnMute notification') }}" title="{{ _('UnMute notification') }}" class="icon icon-mute" ></a>
                     </div>
                 </td>
 
@@ -284,7 +311,7 @@ html[data-darkmode="true"] .watch-tag-list.tag-{{ class_name }} {
                             {%- endfor -%}
                         </div>
                     <div class="status-icons">
-                            <a class="link-spread" href="{{url_for('ui.form_share_put_watch', uuid=watch.uuid)}}"><img src="{{url_for('static_content', group='images', filename='spread.svg')}}" class="status-icon icon icon-spread" title="Create a link to share watch config with others" ></a>
+                            <a class="link-spread" href="{{url_for('ui.form_share_put_watch', uuid=watch.uuid)}}"><img src="{{url_for('static_content', group='images', filename='spread.svg')}}" class="status-icon icon icon-spread" title="{{ _('Create a link to share watch config with others') }}" ></a>
                             {%- set effective_fetcher = watch.get_fetch_backend if watch.get_fetch_backend != "system" else system_default_fetcher -%}
                             {%- if effective_fetcher and ("html_webdriver" in effective_fetcher or "html_" in effective_fetcher or "extra_browser_" in effective_fetcher) -%}
                                 {{ effective_fetcher|fetcher_status_icons }}
@@ -327,13 +354,13 @@ html[data-darkmode="true"] .watch-tag-list.tag-{{ class_name }} {
                 </td>
 {%- endif -%}
             {#last_checked becomes fetch-start-time#}
-                <td class="last-checked" data-timestamp="{{ watch.last_checked }}" data-fetchduration={{ watch.fetch_time }} data-eta_complete="{{ watch.last_checked+watch.fetch_time }}" >
+                <td class="last-checked" data-timestamp="{{ watch.last_checked }}" data-fetchduration={{ watch.fetch_time }} data-eta_complete="{{ watch.last_checked+watch.fetch_time }}" data-label="{{ _('Last Checked') }}">
                     <div class="spinner-wrapper" style="display:none;" >
-                        <span class="spinner"></span><span class="status-text">&nbsp;{{ _('Checking now') }}</span>
+                        <span class="spinner"></span><span class="status-text">&nbsp;{{ watch['__check_status'] or _('Checking now') }}</span>
                     </div>
                     <span class="innertext">{{watch|format_last_checked_time|safe}}</span>
                 </td>
-                <td class="last-changed" data-timestamp="{{ watch.last_changed }}">{%- if watch.history_n >=2 and watch.last_changed >0 -%}
+                <td class="last-changed" data-timestamp="{{ watch.last_changed }}" data-label="{{ _('Last Changed') }}">{%- if watch.history_n >=2 and watch.last_changed >0 -%}
                     {{watch.last_changed|format_timestamp_timeago}}
                     {%- else -%}
                     {{ _('Not yet') }}
@@ -345,7 +372,7 @@ html[data-darkmode="true"] .watch-tag-list.tag-{{ class_name }} {
                     <a href="" class="already-in-queue-button recheck pure-button pure-button-primary" style="display: none;" disabled="disabled">{{ _('Queued') }}</a>
                     <a href="{{ url_for('ui.form_watch_checknow', uuid=watch.uuid, tag=request.args.get('tag')) }}" data-op='recheck' class="ajax-op recheck pure-button pure-button-primary">{{ _('Recheck') }}</a>
                     <a href="{{ url_for('ui.ui_edit.edit_page', uuid=watch.uuid, tag=active_tag_uuid)}}#general" class="pure-button pure-button-primary">{{ _('Edit') }}</a>
-                    <a href="{{ url_for('ui.ui_diff.diff_history_page', uuid=watch.uuid)}}" {{target_attr}} class="pure-button pure-button-primary history-link" style="display: none;">{{ _('History') }}</a>
+                    <a href="{{ url_for('ui.ui_diff.diff_history_page', uuid=watch.uuid)}}" {{target_attr}} class="pure-button pure-button-primary history-link ai-history-btn" style="display: none;" data-uuid="{{ watch.uuid }}" data-summary-url="{{ url_for('ui.ui_diff.diff_llm_summary', uuid=watch.uuid) }}"><span class="btn-label-history">{{ _('History') }}</span><span class="btn-label-summary">&#x2728; {{ _('Summary') }}</span></a>
                     <a href="{{ url_for('ui.ui_preview.preview_page', uuid=watch.uuid)}}" {{target_attr}} class="pure-button pure-button-primary preview-link" style="display: none;">{{ _('Preview') }}</a>
                     </div>
                 </td>

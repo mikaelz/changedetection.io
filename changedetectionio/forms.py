@@ -5,6 +5,8 @@ from wtforms.widgets.core import TimeInput
 from flask_babel import lazy_gettext as _l, gettext
 
 from changedetectionio.blueprint.rss import RSS_FORMAT_TYPES, RSS_TEMPLATE_TYPE_OPTIONS, RSS_TEMPLATE_HTML_DEFAULT
+from changedetectionio.llm.ui_strings import LLM_INTENT_WATCH_PLACEHOLDER
+from changedetectionio.llm.evaluator import DEFAULT_CHANGE_SUMMARY_PROMPT, LLM_DEFAULT_MAX_SUMMARY_TOKENS, LLM_DEFAULT_THINKING_BUDGET
 from changedetectionio.conditions.form import ConditionFormRow
 from changedetectionio.notification_service import NotificationContextData
 from changedetectionio.strtobool import strtobool
@@ -15,7 +17,9 @@ from wtforms import (
     Form,
     Field,
     FloatField,
+    HiddenField,
     IntegerField,
+    PasswordField,
     RadioField,
     SelectField,
     StringField,
@@ -276,11 +280,43 @@ class TimeBetweenCheckForm(Form):
         return True
 
 
+class LabelAfterInputTableWidget(widgets.TableWidget):
+    """
+    Variant of WTForms' TableWidget that renders the input cell before the label cell,
+    so each row is <td>input</td><th>label</th> instead of the default <th>label</th><td>input</td>.
+    """
+
+    def __call__(self, field, **kwargs):
+        from markupsafe import Markup
+        from wtforms.widgets import html_params
+
+        html = []
+        if self.with_table_tag:
+            kwargs.setdefault("id", field.id)
+            html.append(f"<table {html_params(**kwargs)}>")
+        hidden = ""
+        for subfield in field:
+            if subfield.type in ("HiddenField", "CSRFTokenField"):
+                hidden += str(subfield)
+            else:
+                html.append(
+                    f"<tr><td>{hidden}{subfield}</td><th>{subfield.label}</th></tr>"
+                )
+                hidden = ""
+        if self.with_table_tag:
+            html.append("</table>")
+        if hidden:
+            html.append(hidden)
+        return Markup("".join(html))
+
+
 class EnhancedFormField(FormField):
     """
     An enhanced FormField that supports conditional validation with top-level error messages.
     Adds a 'top_errors' property for validation errors at the FormField level.
     """
+
+    widget = LabelAfterInputTableWidget()
 
     def __init__(self, form_class, label=None, validators=None, separator="-",
                  conditional_field=None, conditional_message=None, conditional_test_function=None, **kwargs):
@@ -548,6 +584,17 @@ def validate_url(test_url):
         raise ValidationError('Watch protocol is not permitted or invalid URL format')
 
 
+class validateLLMApiBaseSafe(object):
+    """Block private/loopback/reserved api_base values (SSRF) unless the operator
+    has opted in via ALLOW_IANA_RESTRICTED_ADDRESSES=true."""
+
+    def __call__(self, form, field):
+        from changedetectionio.validate_url import is_llm_api_base_safe
+        ok, reason = is_llm_api_base_safe(field.data)
+        if not ok:
+            raise ValidationError(reason)
+
+
 class ValidateSinglePythonRegexString(object):
     def __init__(self, message=None):
         self.message = message
@@ -615,8 +662,8 @@ class ValidateCSSJSONXPATHInput(object):
                 try:
                     elementpath.select(tree, line.strip(), parser=SafeXPath3Parser)
                 except elementpath.ElementPathError as e:
-                    message = field.gettext('\'%s\' is not a valid XPath expression. (%s)')
-                    raise ValidationError(message % (line, str(e)))
+                    message = field.gettext('\'%(expression)s\' is not a valid XPath expression. (%(error)s)')
+                    raise ValidationError(message % {'expression': line, 'error': str(e)})
                 except:
                     raise ValidationError("A system-error occurred when validating your XPath expression")
 
@@ -630,8 +677,8 @@ class ValidateCSSJSONXPATHInput(object):
                 try:
                     tree.xpath(line.strip())
                 except etree.XPathEvalError as e:
-                    message = field.gettext('\'%s\' is not a valid XPath expression. (%s)')
-                    raise ValidationError(message % (line, str(e)))
+                    message = field.gettext('\'%(expression)s\' is not a valid XPath expression. (%(error)s)')
+                    raise ValidationError(message % {'expression': line, 'error': str(e)})
                 except:
                     raise ValidationError("A system-error occurred when validating your XPath expression")
 
@@ -650,8 +697,8 @@ class ValidateCSSJSONXPATHInput(object):
                 try:
                     parse(input)
                 except (JsonPathParserError, JsonPathLexerError) as e:
-                    message = field.gettext('\'%s\' is not a valid JSONPath expression. (%s)')
-                    raise ValidationError(message % (input, str(e)))
+                    message = field.gettext('\'%(expression)s\' is not a valid JSONPath expression. (%(error)s)')
+                    raise ValidationError(message % {'expression': input, 'error': str(e)})
                 except:
                     raise ValidationError("A system-error occurred when validating your JSONPath expression")
 
@@ -674,8 +721,8 @@ class ValidateCSSJSONXPATHInput(object):
                     validate_jq_expression(input)
                     jq.compile(input)
                 except (ValueError) as e:
-                    message = field.gettext('\'%s\' is not a valid jq expression. (%s)')
-                    raise ValidationError(message % (input, str(e)))
+                    message = field.gettext('\'%(expression)s\' is not a valid jq expression. (%(error)s)')
+                    raise ValidationError(message % {'expression': input, 'error': str(e)})
                 except:
                     raise ValidationError("A system-error occurred when validating your jq expression")
 
@@ -725,7 +772,7 @@ class ValidateStartsWithRegex(object):
                 raise ValidationError(self.message or _l("Invalid value."))
 
 class quickWatchForm(Form):
-    url = fields.URLField(_l('URL'), validators=[validateURL()])
+    url = StringField('URL', validators=[validateURL()])
     tags = StringTagUUID(_l('Group tag'), validators=[validators.Optional()])
     watch_submit_button = SubmitField(_l('Watch'), render_kw={"class": "pure-button pure-button-primary"})
     processor = RadioField(_l('Processor'), choices=lambda: processors.available_processors(), default=processors.get_default_processor)
@@ -771,16 +818,16 @@ class SingleBrowserStep(Form):
     operation = SelectField(_l('Operation'), [validators.Optional()], choices=browser_step_ui_config.keys())
 
     # maybe better to set some <script>var..
-    selector = StringField(_l('Selector'), [validators.Optional()], render_kw={"placeholder": "CSS or xPath selector"})
-    optional_value = StringField(_l('value'), [validators.Optional()], render_kw={"placeholder": "Value"})
+    selector = StringField(_l('Selector'), [validators.Optional()], render_kw={"placeholder": _l("CSS or xPath selector")})
+    optional_value = StringField(_l('value'), [validators.Optional()], render_kw={"placeholder": _l("Value")})
 #   @todo move to JS? ajax fetch new field?
 #    remove_button = SubmitField(_l('-'), render_kw={"type": "button", "class": "pure-button pure-button-primary", 'title': 'Remove'})
 #    add_button = SubmitField(_l('+'), render_kw={"type": "button", "class": "pure-button pure-button-primary", 'title': 'Add new step after'})
 
 class processor_text_json_diff_form(commonSettingsForm):
 
-    url = fields.URLField('Web Page URL', validators=[validateURL()])
-    tags = StringTagUUID('Group Tag', [validators.Optional()], default='')
+    url = StringField(_l('Web Page URL'), validators=[validateURL()])
+    tags = StringTagUUID(_l('Group Tag'), [validators.Optional()], default='')
 
     time_between_check = EnhancedFormField(
         TimeBetweenCheckForm,
@@ -794,10 +841,18 @@ class processor_text_json_diff_form(commonSettingsForm):
 
     time_between_check_use_default = BooleanField(_l('Use global settings for time between check and scheduler.'), default=False)
 
+    llm_intent = TextAreaField(_l('AI Change Intent'), validators=[validators.Optional(), validators.Length(max=2000)],
+                               render_kw={"rows": "5", "placeholder": LLM_INTENT_WATCH_PLACEHOLDER})
+
+    llm_change_summary = TextAreaField(_l('AI Change Summary'), validators=[validators.Optional(), validators.Length(max=2000)],
+                               render_kw={"rows": "5", "placeholder": DEFAULT_CHANGE_SUMMARY_PROMPT},
+                               default='')
+
     include_filters = StringListField(_l('CSS/JSONPath/JQ/XPath Filters'), [ValidateCSSJSONXPATHInput()], default='')
 
     subtractive_selectors = StringListField(_l('Remove elements'), [ValidateCSSJSONXPATHInput(allow_json=False)])
 
+    extract_lines_containing = StringListField(_l('Extract lines containing'), [validators.Optional()])
     extract_text = StringListField(_l('Extract text'), [ValidateListRegex()])
 
     title = StringField(_l('Title'), default='')
@@ -917,7 +972,7 @@ class processor_text_json_diff_form(commonSettingsForm):
 
 class SingleExtraProxy(Form):
     # maybe better to set some <script>var..
-    proxy_name = StringField(_l('Name'), [validators.Optional()], render_kw={"placeholder": "Name"})
+    proxy_name = StringField(_l('Name'), [validators.Optional()], render_kw={"placeholder": _l("Name")})
     proxy_url = StringField(_l('Proxy URL'), [
         validators.Optional(),
         ValidateStartsWithRegex(
@@ -929,7 +984,7 @@ class SingleExtraProxy(Form):
     ], render_kw={"placeholder": "socks5:// or regular proxy http://user:pass@...:3128", "size":50})
 
 class SingleExtraBrowser(Form):
-    browser_name = StringField(_l('Name'), [validators.Optional()], render_kw={"placeholder": "Name"})
+    browser_name = StringField(_l('Name'), [validators.Optional()], render_kw={"placeholder": _l("Name")})
     browser_connection_url = StringField(_l('Browser connection URL'), [
         validators.Optional(),
         ValidateStartsWithRegex(
@@ -988,7 +1043,7 @@ class globalSettingsApplicationForm(commonSettingsForm):
     api_access_token_enabled = BooleanField(_l('API access token security check enabled'), default=True, validators=[validators.Optional()])
     base_url = StringField(_l('Notification base URL override'),
                            validators=[validators.Optional()],
-                           render_kw={"placeholder": os.getenv('BASE_URL', 'Not set')}
+                           render_kw={"placeholder": os.getenv('BASE_URL', _l('Not set'))}
                            )
     empty_pages_are_a_change =  BooleanField(_l('Treat empty pages as a change?'), default=False)
     fetch_backend = RadioField(_l('Fetch Method'), default="html_requests", choices=content_fetchers.available_fetchers(), validators=[ValidateContentFetcherIsReady()])
@@ -998,7 +1053,7 @@ class globalSettingsApplicationForm(commonSettingsForm):
 
     # Screenshot comparison settings
     min_change_percentage = FloatField(
-        'Screenshot: Minimum Change Percentage',
+        _l('Screenshot: Minimum Change Percentage'),
         validators=[
             validators.Optional(),
             validators.NumberRange(min=0.0, max=100.0, message=_l('Must be between 0 and 100'))
@@ -1038,6 +1093,149 @@ class globalSettingsApplicationForm(commonSettingsForm):
     ui = FormField(globalSettingsApplicationUIForm)
 
 
+class globalSettingsLLMForm(Form):
+    """
+    LLM / AI provider settings — stored under datastore['settings']['application']['llm'].
+
+    Uses litellm under the hood, so the model string encodes both the provider and model.
+    No separate provider dropdown needed — litellm routes automatically:
+      gpt-4o-mini                           → OpenAI
+      claude-3-5-haiku-20251001             → Anthropic
+      ollama/llama3.2                       → Ollama
+      openrouter/google/gemma-3-12b-it:free → OpenRouter (free tier)
+      gemini/gemini-2.0-flash               → Google Gemini
+      azure/gpt-4o                          → Azure OpenAI
+    """
+    model = StringField(
+        _l('Model'),
+        validators=[validators.Optional()],
+        render_kw={"placeholder": "gpt-4o-mini", "style": "width: 24em;"},
+    )
+    api_key = PasswordField(
+        _l('API Key'),
+        validators=[validators.Optional()],
+        render_kw={
+            "autocomplete": "off",
+            "style": "width: 24em;",
+        },
+    )
+    api_base = StringField(
+        _l('API Base URL'),
+        validators=[validators.Optional(), validateLLMApiBaseSafe()],
+        render_kw={
+            "placeholder": "http://localhost:11434  (Ollama / custom endpoints only)",
+            "style": "width: 24em;",
+        },
+    )
+    # Persisted by the Provider dropdown JS — lets the backend distinguish a self-hosted
+    # OpenAI-compatible endpoint (vLLM, LM Studio, llama.cpp) from cloud OpenAI, so we can
+    # apply reasoning-friendly token caps only when the user opted in.
+    provider_kind = HiddenField(
+        validators=[validators.Optional()],
+        default='',
+    )
+    # Multiplier applied to LLM max_tokens caps when provider_kind is 'ollama' or
+    # 'openai_compatible' — endpoints that commonly serve reasoning models (Qwen3,
+    # DeepSeek-R1, Gemma 3, etc.) which emit chain-of-thought into
+    # message.reasoning_content before the final answer lands in message.content.
+    # Cloud providers with non-reasoning defaults (OpenAI, Anthropic, Gemini,
+    # OpenRouter) stay on the original tight caps so existing users see no
+    # behavior or cost change. Users on paid Ollama / openai_compatible endpoints
+    # who care about cost can dial this down to 1x.
+    local_token_multiplier = IntegerField(
+        _l('Token multiplier for local reasoning models'),
+        validators=[validators.Optional(), validators.NumberRange(min=1, max=20)],
+        default=5,
+        render_kw={"placeholder": "5", "style": "width: 6em;"},
+    )
+    change_summary_default = TextAreaField(
+        _l('Default AI Change Summary prompt'),
+        validators=[validators.Optional(), validators.Length(max=2000)],
+        render_kw={
+            "rows": "5",
+            "placeholder": DEFAULT_CHANGE_SUMMARY_PROMPT,
+            "style": "width: 100%; ",
+        },
+        default='',
+    )
+    max_tokens_per_count_period = IntegerField(
+        _l('Max tokens per watch per period'),
+        validators=[validators.Optional(), validators.NumberRange(min=0)],
+        default=0,
+        render_kw={
+            "placeholder": "0 = unlimited",
+            "style": "width: 8em;",
+        },
+    )
+    token_budget_month = IntegerField(
+        _l('Monthly token budget'),
+        validators=[validators.Optional(), validators.NumberRange(min=0)],
+        default=0,
+        render_kw={"style": "width: 10em;"},
+    )
+    max_input_chars = IntegerField(
+        _l('Max input characters'),
+        validators=[validators.Optional(), validators.NumberRange(min=1)],
+        default=100000,
+        render_kw={
+            "placeholder": "100000",
+            "style": "width: 10em;",
+        },
+    )
+    # Master on/off switch for ALL LLM lookups at runtime. When False, every entry point
+    # in evaluator.py (and the restock fallback) short-circuits with a logger.debug
+    # message — even if a provider+model is still configured. Saved config and the
+    # "configured" badge remain visible so the user can toggle back on without re-entering.
+    enabled = BooleanField(
+        _l('Enable AI / LLM features'),
+        default=True,
+    )
+    override_diff_with_summary = BooleanField(
+        _l('Replace {{diff}} notification token with AI summary'),
+        default=True,
+    )
+    restock_use_fallback_extract = BooleanField(
+        _l('Use LLM as a fallback for extracting price and restock info'),
+        default=True,
+    )
+    debug = BooleanField(
+        _l('Enable LLM debug logging'),
+        default=False,
+    )
+    thinking_budget = SelectField(
+        _l('AI thinking budget (tokens)'),
+        choices=[
+            ('0',    _l('Off (no thinking)')),
+            ('100',  '100'),
+            ('500',  '500'),
+            ('2000', '2000'),
+        ],
+        default=str(LLM_DEFAULT_THINKING_BUDGET),
+        validators=[validators.Optional()],
+    )
+    max_summary_tokens = SelectField(
+        _l('Max AI summary length (tokens)'),
+        choices=[
+            ('500',   '500'),
+            ('1000',  '1000'),
+            ('3000',  '3000'),
+            ('5000',  '5000'),
+            ('10000', '10000'),
+            ('15000', '15000'),
+        ],
+        default=str(LLM_DEFAULT_MAX_SUMMARY_TOKENS),
+        validators=[validators.Optional()],
+    )
+    budget_action = RadioField(
+        _l('When monthly token budget is reached'),
+        choices=[
+            ('skip_llm',   _l('Skip AI summarisation only (watch still checks)')),
+            ('skip_check', _l('Skip the watch check entirely')),
+        ],
+        default='skip_llm',
+    )
+
+
 class globalSettingsForm(Form):
     # Define these as FormFields/"sub forms", this way it matches the JSON storage
     # datastore.data['settings']['application']..
@@ -1050,6 +1248,7 @@ class globalSettingsForm(Form):
 
     requests = FormField(globalSettingsRequestForm)
     application = FormField(globalSettingsApplicationForm)
+    llm = FormField(globalSettingsLLMForm)
     save_button = SubmitField(_l('Save'), render_kw={"class": "pure-button pure-button-primary"})
 
 

@@ -9,8 +9,15 @@ from changedetectionio.pluggy_interface import apply_update_handler_alter, apply
 
 import asyncio
 import os
+import re
 import sys
 import time
+
+# Allow alphanumerics, space, and a small set of punctuation that appears in legitimate
+# status strings ("Querying AI/LLM (intent)..", "Fetching page.."). Anything that could
+# be HTML-active (<, >, &, ", ', =, ;, {, }, `, \) is stripped.
+_MINITEXT_STATUS_SAFE_RE = re.compile(r'[^A-Za-z0-9 ().,/:\-]')
+_MINITEXT_STATUS_MAX_LEN = 80
 
 from loguru import logger
 
@@ -19,6 +26,22 @@ from loguru import logger
 
 IN_PYTEST = "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
 DEFER_SLEEP_TIME_ALREADY_QUEUED = 0.3 if IN_PYTEST else 10.0
+
+
+def set_watch_minitext_status(watch, status):
+    """
+    Set a transient status line for a watch (e.g. "Fetching page..", "Querying AI/LLM..").
+
+    Writes to watch['__check_status'] so a client reloading the page can render the
+    last known status, and fires the realtime signal so already-connected clients
+    update live. __-prefixed key is filtered from disk by Watch._get_commit_data().
+
+    Status is sanitized to alphanumerics, space, and safe punctuation only.
+    """
+    safe_status = _MINITEXT_STATUS_SAFE_RE.sub('', str(status))[:_MINITEXT_STATUS_MAX_LEN]
+    watch['__check_status'] = safe_status
+    signal('watch_small_status_comment').send(watch_uuid=watch['uuid'], status=safe_status)
+
 
 async def async_update_worker(worker_id, q, notification_q, app, datastore, executor=None):
     """
@@ -159,8 +182,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     # Allow plugins to modify/wrap the update_handler
                     update_handler = apply_update_handler_alter(update_handler, watch, datastore)
 
-                    update_signal = signal('watch_small_status_comment')
-                    update_signal.send(watch_uuid=uuid, status="Fetching page..")
+                    set_watch_minitext_status(watch, "Fetching page..")
 
                     # All fetchers are now async, so call directly
                     await update_handler.call_browser()
@@ -405,6 +427,90 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     try:
                         # Reset the edited flag BEFORE update_watch (which calls watch.update() and would set it again)
                         watch.reset_watch_edited_flag()
+
+                        # LLM evaluation — intent filtering + change summary
+                        update_obj['_llm_result'] = None
+                        update_obj['_llm_intent'] = ''
+                        update_obj['_llm_change_summary'] = ''
+                        # skip_check: when budget exceeded, don't run LLM or the check.
+                        # Also gated on llm_enabled — a disabled LLM can't be spending tokens,
+                        # so the budget enforcement shouldn't suppress changes when the user
+                        # has explicitly switched LLM off.
+                        from changedetectionio.llm.evaluator import is_llm_features_disabled as _is_llm_features_disabled, get_llm_settings as _get_llm_settings
+                        _llm_settings = _get_llm_settings(datastore)
+                        _llm_master_enabled = _llm_settings.enabled and not _is_llm_features_disabled()
+                        _llm_budget_action = _llm_settings.budget_action
+                        if _llm_master_enabled and _llm_budget_action == 'skip_check':
+                            from changedetectionio.llm.evaluator import is_global_token_budget_exceeded
+                            if is_global_token_budget_exceeded(datastore):
+                                logger.info(f"LLM monthly budget exceeded — skipping check for {uuid} (budget_action=skip_check)")
+                                changed_detected = False
+
+                        if changed_detected:
+                            try:
+                                from changedetectionio.llm.evaluator import (
+                                    evaluate_change, resolve_intent, resolve_llm_field,
+                                    summarise_change, _runtime_llm_config,
+                                )
+                                # _runtime_llm_config returns None (and logs a debug skip
+                                # message) when the master 'llm_enabled' toggle is off, so
+                                # the whole block — diff computation, status minitext, and
+                                # the two executor dispatches — is skipped, not just the
+                                # inner LLM lookups.
+                                _llm_cfg = _runtime_llm_config(datastore)
+                                if _llm_cfg:
+                                    # Compute unified diff once — used by both intent and summary
+                                    _watch_dates = list(watch.history.keys())
+                                    # Capture from_version before new snapshot is added
+                                    _llm_from_version = _watch_dates[-1] if _watch_dates else None
+                                    if _watch_dates:
+                                        _prev_text = watch.get_history_snapshot(timestamp=_watch_dates[-1]) or ''
+                                        from difflib import unified_diff as _unified_diff
+                                        _diff_lines = list(_unified_diff(
+                                            _prev_text.splitlines(keepends=True),
+                                            contents.splitlines(keepends=True),
+                                            lineterm='',
+                                            n=3
+                                        ))
+                                        _diff_text = ''.join(_diff_lines) if _diff_lines else contents
+                                    else:
+                                        _diff_text = contents
+
+                                    # Step 1: AI Change Intent — may suppress notification
+                                    _llm_intent, _llm_intent_source = resolve_intent(watch, datastore)
+                                    if _llm_intent:
+                                        set_watch_minitext_status(watch, "AI/LLM (rules)..")
+                                        _llm_result = await loop.run_in_executor(
+                                            executor,
+                                            lambda diff=_diff_text, snap=contents: evaluate_change(
+                                                watch, datastore, diff=diff, current_snapshot=snap
+                                            )
+                                        )
+                                        update_obj['_llm_result'] = _llm_result
+                                        update_obj['_llm_intent'] = _llm_intent
+
+                                        if _llm_result and not _llm_result.get('important', True):
+                                            changed_detected = False
+                                            logger.info(
+                                                f"LLM filtered out change for {uuid} "
+                                                f"(intent from {_llm_intent_source}): "
+                                                f"{_llm_result.get('summary', '')[:80]}"
+                                            )
+
+                                    # Step 2: AI Change Summary — runs for any LLM-configured watch with a change
+                                    if changed_detected:
+                                        set_watch_minitext_status(watch, "AI/LLM (summary)..")
+                                        _change_summary = await loop.run_in_executor(
+                                            executor,
+                                            lambda diff=_diff_text, snap=contents: summarise_change(
+                                                watch, datastore, diff=diff, current_snapshot=snap
+                                            )
+                                        )
+                                        if _change_summary:
+                                            update_obj['_llm_change_summary'] = _change_summary
+                            except Exception as e:
+                                logger.warning(f"LLM evaluation error for {uuid}: {e}")
+
                         datastore.update_watch(uuid=uuid, update_obj=update_obj)
 
                         if changed_detected or not watch.history_n:
@@ -431,6 +537,35 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                             watch.save_history_blob(contents=contents,
                                                     timestamp=int(fetch_start_time),
                                                     snapshot_id=update_obj.get('previous_md5', 'none'))
+
+                            # Save AI summary file now that the new snapshot is committed —
+                            # watch.history.keys()[-1] now reflects the just-saved version,
+                            # so the cache filename matches what the UI will later look up.
+                            # Cache key must use build_summary_cache_prompt() with UI defaults so
+                            # the worker write and the UI read hash to the same prompt_hash.
+                            if update_obj.get('_llm_change_summary') and _llm_from_version:
+                                try:
+                                    from changedetectionio.llm.evaluator import (
+                                        get_effective_summary_prompt, build_summary_cache_prompt,
+                                    )
+                                    _llm_to_version = list(watch.history.keys())[-1]
+                                    from changedetectionio.llm.evaluator import get_llm_settings as _get_llm_settings_inner
+                                    _ls = _get_llm_settings_inner(datastore)
+                                    _llm_max_summary_tokens = _ls.max_summary_tokens
+                                    _llm_model = _ls.model
+                                    _llm_cache_prompt = build_summary_cache_prompt(
+                                        effective_prompt=get_effective_summary_prompt(watch, datastore),
+                                        max_summary_tokens=_llm_max_summary_tokens,
+                                        model=_llm_model,
+                                    )
+                                    watch.save_llm_diff_summary(
+                                        update_obj['_llm_change_summary'],
+                                        _llm_from_version,
+                                        _llm_to_version,
+                                        prompt=_llm_cache_prompt,
+                                    )
+                                except Exception as _fe:
+                                    logger.warning(f"Could not write change-summary file for {uuid}: {_fe}")
 
                             empty_pages_are_a_change = datastore.data['settings']['application'].get('empty_pages_are_a_change', False)
                             if update_handler.fetcher.content or (not update_handler.fetcher.content and empty_pages_are_a_change):
@@ -484,7 +619,8 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     # Store favicon if necessary
                     if update_handler.fetcher.favicon_blob and update_handler.fetcher.favicon_blob.get('base64'):
                         watch.bump_favicon(url=update_handler.fetcher.favicon_blob.get('url'),
-                                           favicon_base_64=update_handler.fetcher.favicon_blob.get('base64')
+                                           favicon_base_64=update_handler.fetcher.favicon_blob.get('base64'),
+                                           mime_type=update_handler.fetcher.favicon_blob.get('mime_type')
                                            )
 
                     datastore.update_watch(uuid=uuid, update_obj=final_updates)
@@ -581,6 +717,8 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                 finally:
                     # Send completion signal - retrieve by name to ensure thread-safe access
                     if watch:
+                        # Clear transient in-memory status — check is done
+                        watch.pop('__check_status', None)
                         watch_check_update = signal('watch_check_update')
                         watch_check_update.send(watch_uuid=watch['uuid'])
 

@@ -28,7 +28,7 @@ info:
     
     For example: `x-api-key: YOUR_API_KEY`
     
-  version: 0.1.6
+  version: 0.1.7
   contact:
     name: ChangeDetection.io
     url: https://github.com/dgtlmoon/changedetection.io
@@ -460,6 +460,13 @@ components:
             maxLength: 5000
           maxItems: 100
           description: Text that should NOT be present (triggers alert if found)
+        extract_lines_containing:
+          type: array
+          items:
+            type: string
+            maxLength: 5000
+          maxItems: 100
+          description: Keep only lines containing these substrings (plain text, case-insensitive) — simpler alternative to regex
         extract_text:
           type: array
           items:
@@ -587,6 +594,42 @@ components:
           default: 'ALL'
           description: Logic operator - ALL (match all conditions) or ANY (match any condition)
 
+        # AI / LLM
+        llm_intent:
+          type: string
+          maxLength: 2000
+          default: ''
+          description: Plain-English intent for AI-based change filtering. The AI evaluates every detected change against this and only notifies when it matches.
+        llm_change_summary:
+          type: string
+          maxLength: 2000
+          default: ''
+          description: Instructions for the AI to summarise changes in notifications. When set, replaces {{diff}} with a human-readable description.
+        llm_prefilter:
+          type: [string, 'null']
+          readOnly: true
+          description: CSS selector derived by the AI to narrow content scope before evaluation (auto-managed, do not set manually).
+        llm_evaluation_cache:
+          type: object
+          readOnly: true
+          description: Internal cache of AI evaluation results keyed by (intent, diff) hash (auto-managed).
+        llm_last_tokens_used:
+          type: [integer, 'null']
+          readOnly: true
+          description: Number of tokens consumed by the AI on the most recent check.
+        llm_tokens_used_cumulative:
+          type: [integer, 'null']
+          readOnly: true
+          description: Total tokens consumed by the AI across all checks for this watch.
+        llm_tokens_this_period:
+          type: [integer, 'null']
+          readOnly: true
+          description: Tokens consumed by the AI on this watch within the current rollover period (currently month). Used to enforce max_tokens_per_count_period.
+        llm_tokens_period_key:
+          type: [string, 'null']
+          readOnly: true
+          description: Identifier of the current rollover period (e.g. "2026-05"). Set automatically; resets llm_tokens_this_period when the period changes.
+
     DaySchedule:
       type: object
       properties:
@@ -692,6 +735,37 @@ components:
               description: Number of history snapshots available
               readOnly: true
               x-computed: true
+            processor_config_restock_diff:
+              type: object
+              readOnly: true
+              x-computed: true
+              description: |
+                Resolved restock/price processor config for this watch.
+                If a tag with `overrides_watch: true` is assigned to this watch, the tag's config is
+                returned here instead of the watch's own config. Use `processor_config_restock_diff_source`
+                to determine where the config originated.
+              properties:
+                in_stock_processing:
+                  type: string
+                  enum: [in_stock_only, all_changes, 'off']
+                follow_price_changes:
+                  type: boolean
+                price_change_min:
+                  type: [number, 'null']
+                price_change_max:
+                  type: [number, 'null']
+                price_change_threshold_percent:
+                  type: [number, 'null']
+                  minimum: 0
+                  maximum: 100
+            processor_config_restock_diff_source:
+              type: string
+              readOnly: true
+              x-computed: true
+              description: |
+                Indicates the origin of `processor_config_restock_diff`.
+                - `watch`: config comes from the watch itself
+                - `tag:<uuid>`: config is overridden by the tag with the given UUID
 
     CreateWatch:
       allOf:
@@ -725,6 +799,13 @@ components:
                 - true: Tag settings override watch settings
                 - false: Tag settings do not override (watches use their own settings)
                 - null: Not decided yet / inherit default behavior
+            url_match_pattern:
+              type: string
+              description: |
+                Automatically apply this tag to any watch whose URL matches this pattern.
+                Supports fnmatch wildcards (* and ?): e.g. *://example.com/* or github.com/myorg.
+                Plain strings are matched as case-insensitive substrings.
+                Leave empty to disable auto-matching.
             # Future: Aggregated statistics from all watches with this tag
             # check_count:
             #   type: integer

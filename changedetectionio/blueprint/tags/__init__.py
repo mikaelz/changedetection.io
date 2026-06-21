@@ -5,6 +5,7 @@ from loguru import logger
 
 from changedetectionio.store import ChangeDetectionStore
 from changedetectionio.flask_app import login_optionally_required
+from changedetectionio.llm.evaluator import get_llm_config as _get_llm_config
 
 
 def construct_blueprint(datastore: ChangeDetectionStore):
@@ -22,11 +23,14 @@ def construct_blueprint(datastore: ChangeDetectionStore):
 
         tag_count = Counter(tag for watch in datastore.data['watching'].values() if watch.get('tags') for tag in watch['tags'])
 
+        from changedetectionio import processors
         output = render_template("groups-overview.html",
                                  app_rss_token=datastore.data['settings']['application'].get('rss_access_token'),
                                  available_tags=sorted_tags,
                                  form=add_form,
+                                 generate_tag_colors=processors.generate_processor_badge_colors,
                                  tag_count=tag_count,
+                                 wcag_text_color=processors.wcag_text_color,
                                  )
 
         return output
@@ -180,6 +184,7 @@ def construct_blueprint(datastore: ChangeDetectionStore):
             'form': form,
             'watch': default,
             'extra_notification_token_placeholder_info': datastore.get_unique_notification_token_placeholders_available(),
+            'llm_configured': bool(_get_llm_config(datastore)),
         }
 
         included_content = {}
@@ -208,9 +213,17 @@ def construct_blueprint(datastore: ChangeDetectionStore):
             template = env.from_string(template_str)
             included_content = template.render(**template_args)
 
+        # Watches whose URL currently matches this tag's pattern
+        matching_watches = {
+            w_uuid: watch
+            for w_uuid, watch in datastore.data['watching'].items()
+            if default.matches_url(watch.get('url', ''))
+        }
+
         output = render_template("edit-tag.html",
                                  extra_form_content=included_content,
                                  extra_tab_content=form.extra_tab_content() if form.extra_tab_content() else None,
+                                 matching_watches=matching_watches,
                                  settings_application=datastore.data['settings']['application'],
                                  **template_args
                                  )

@@ -70,6 +70,9 @@ class model(dict):
                     'shared_diff_access': False,
                     'strip_ignored_lines': False,
                     'tags': None,  # Initialized in __init__ with real datastore_path
+                    # All LLM settings now live nested under application.llm.* (post-migration update_31).
+                    # Defaults come from LLMSettings.model_validate({}) at read time —
+                    # no need to pre-seed an empty {} here.
                     'webdriver_delay': None , # Extra delay in seconds before extracting text
                     'ui': {
                         'use_page_title_in_list': True,

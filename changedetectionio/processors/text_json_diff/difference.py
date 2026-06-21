@@ -7,6 +7,7 @@ a side-by-side or unified diff view with syntax highlighting and change markers.
 
 import os
 import time
+from flask_babel import gettext
 from loguru import logger
 
 from changedetectionio import diff, strtobool
@@ -97,6 +98,7 @@ DIFF_PREFERENCES_CONFIG = {
     'added': {'default': True, 'type': 'bool'},
     'replaced': {'default': True, 'type': 'bool'},
     'type': {'default': 'diffLines', 'type': 'value'},
+    'llm_all_changes': {'default': False, 'type': 'bool'},
 }
 
 def render(watch, datastore, request, url_for, render_template, flash, redirect, extract_form=None):
@@ -198,6 +200,36 @@ def render(watch, datastore, request, url_for, render_template, flash, redirect,
     if str(from_version) != str(dates[-2]) or str(to_version) != str(dates[-1]):
         note = 'Note: You are not viewing the latest changes.'
 
+    llm_configured = bool(
+        datastore.data.get('settings', {}).get('application', {}).get('llm', {}).get('model')
+    )
+
+    # Load cached AI diff summary for this exact from→to + prompt combination
+    viewing_latest = str(to_version) == str(dates[-1])
+    llm_diff_summary = ''
+    llm_summary_prompt = ''
+    if llm_configured:
+        try:
+            from changedetectionio.llm.evaluator import (
+                get_effective_summary_prompt, build_summary_cache_prompt,
+            )
+            _prompt = get_effective_summary_prompt(watch, datastore)
+            llm_summary_prompt = _prompt
+            # Must match the cache_prompt the worker writes and the UI ajax route reads —
+            # using UI default diff prefs so the initial render finds the worker's pre-cache.
+            from changedetectionio.llm.evaluator import get_llm_settings
+            _ls = get_llm_settings(datastore)
+            _max_summary_tokens = _ls.max_summary_tokens
+            _llm_model = _ls.model
+            _cache_prompt = build_summary_cache_prompt(
+                effective_prompt=_prompt,
+                max_summary_tokens=_max_summary_tokens,
+                model=_llm_model,
+            )
+            llm_diff_summary = watch.get_llm_diff_summary(from_version, to_version, prompt=_cache_prompt)
+        except Exception as e:
+            logger.warning(f"Could not load llm-diff-summary for {uuid}: {e}")
+
     output = render_template("diff.html",
                              #initial_scroll_line_number=100,
                              bottom_horizontal_offscreen_contents=offscreen_content,
@@ -205,9 +237,9 @@ def render(watch, datastore, request, url_for, render_template, flash, redirect,
                              current_diff_url=watch['url'],
                              diff_cell_grid=diff_cell_grid,
                              diff_prefs=diff_prefs,
-                             extra_classes='difference-page',
+                             extra_classes=' '.join(filter(None, ['difference-page', 'llm-configured' if llm_configured else ''])),
                              extra_stylesheets=extra_stylesheets,
-                             extra_title=f" - {watch.label} - History",
+                             extra_title=f" - {watch.label} - {gettext('History')}",
                              extract_form=extract_form,
                              from_version=str(from_version),
                              is_html_webdriver=is_html_webdriver,
@@ -224,5 +256,9 @@ def render(watch, datastore, request, url_for, render_template, flash, redirect,
                              uuid=uuid,
                              versions=dates,  # All except current/last
                              watch_a=watch,
+                             llm_configured=llm_configured,
+                             llm_diff_summary=llm_diff_summary,
+                             llm_summary_prompt=llm_summary_prompt,
+                             viewing_latest=viewing_latest,
                              )
     return output
